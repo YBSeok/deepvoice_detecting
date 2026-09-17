@@ -1,0 +1,38 @@
+# Contest weights — keep local / inside submit.zip only
+model/**/*.pt
+model/**/*.pth
+model/**/*.bin
+model/**/*.safetensors
+model/**/*.th
+model/**/*.ckpt
+model/**/*.onnx
+model/**/*.tar
+model/**/*.tar.gz
+model/**/*.h5
+model/**/*.pkl
+model/**/*.pickle
+model/**/*.npy
+model/**/*.npz
+model/**/*.msgpack
+
+# Submission artifacts and eval I/O
+*.zip
+output/
+data/test/
+data/**/*.wav
+data/**/*.mp3
+data/**/*.flac
+data/**/*.ogg
+data/**/*.m4a
+data/**/*.aac
+data/**/*.opus
+data/**/*.wma
+
+# Caches and local env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.cache/
+.venv/
+venv/
+.env

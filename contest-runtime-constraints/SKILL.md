@@ -1,6 +1,6 @@
 ---
 name: contest-runtime-constraints
-description: Enforces the AI-generated audio detection contest runtime, size, hardware, offline, input, and output constraints. Use when implementing, modifying, reviewing, or optimizing the deepvoice baseline, script.py, submit.zip, model loading, inference, PANNs, HTDemucs, DF-Arena, fusion, or submission.csv.
+description: Enforces the AI-generated audio detection contest runtime, size, hardware, offline, input, and output constraints. Use when implementing, modifying, reviewing, or optimizing the deepvoice baseline, script.py, submit.zip, model loading, from_pretrained, HuggingFace Hub, inference, PANNs, HTDemucs, DF-Arena, fusion, or submission.csv.
 ---
 
 # Contest Runtime Constraints
@@ -57,7 +57,46 @@ description: Enforces the AI-generated audio detection contest runtime, size, ha
 
 `FILE_FAKE_PROB`는 “한쪽이라도 FAKE이면 파일 FAKE”와 맞아야 한다. 존재 확률이 낮은 성분의 fake 점수가 파일 점수를 지배하지 않게 결합한다. 베이스라인은 `max(VP×VF, MP×MF)`다.
 
-## Offline loading
+## 오프라인 환경 제약사항
+
+패키지(라이브러리) 설치 과정을 제외하고는 완전한 오프라인 환경에서 실행됩니다.
+
+### 불가능한 작업들
+
+- `model.from_pretrained()` 등을 통한 온라인 모델 다운로드
+- 외부 API 호출 (OpenAI, HuggingFace Hub 등)
+- 인터넷을 통한 파일 다운로드
+- 원격 데이터베이스 접근
+
+### 올바른 접근 방법
+
+- 필요한 모든 모델 파일을 `model/` 디렉터리에 미리 저장
+- 토크나이저, 설정 파일 등도 로컬 파일로 준비
+- 코드에서는 로컬 파일 경로로만 접근
+
+### 코드 예시
+
+❌ 잘못된 예시 - 온라인 다운로드 시도
+
+```python
+model = AutoModel.from_pretrained("bert-base-uncased")  # 실패!
+```
+
+✅ 올바른 예시 - 로컬 파일 사용
+
+```python
+model_path = os.path.join('model', 'bert-base-uncased')
+model = AutoModel.from_pretrained(model_path)  # 성공!
+```
+
+이 프로젝트에서는 허브 id 대신 상대 경로만 쓴다. 예: `os.path.join('model', 'df_arena_1b')`.
+
+### 필수 준수사항
+
+- 반드시 `output/submission.csv` 파일 생성
+- 상대 경로 사용 권장
+- 대회에서 제한하는 추론 시간 내 완료
+- 예외 처리 코드 포함 권장
 
 추론 코드는 로컬 `model/`만 사용한다.
 
@@ -66,9 +105,12 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 ```
 
-- `from_pretrained(..., local_files_only=True)`
+- `from_pretrained`는 로컬 경로 + `local_files_only=True`만 허용한다. 모델 id 문자열은 금지
 - Hugging Face/torch hub 실시간 다운로드 경로를 남기지 않는다
 - 새 가중치는 제출물에 포함하여 용량 한도를 다시 계산한다
+- `~/.cache/huggingface` 등 홈 캐시에 의존하지 않는다. 오프라인에서 없다
+- 절대 경로(`C:\...`, `/home/...`) 대신 `model/`, `data/`, `output/` 상대 경로를 쓴다
+- 파일 단위 try/except를 두어 한 샘플 실패가 전체 제출을 막지 않게 한다. 실패한 행은 0.0으로 채우고 반드시 `output/submission.csv`를 남긴다
 
 경로 규약:
 
@@ -151,11 +193,13 @@ zip ≤ 10GB, 언팩 ≤ 32GB. 새 가중치를 넣기 전에 추정한다.
 - [ ] 1,200 × 최악 1분 오디오로 60분 안인가?
 - [ ] 피크 VRAM이 22.4GiB 아래인가? (동시 상주 모델 합)
 - [ ] 피크 RAM이 28GB 아래인가?
-- [ ] 추론 중 네트워크 호출이 0인가?
+- [ ] 추론 중 네트워크 호출이 0인가? (`from_pretrained` 허브 id, Hub/API/URL 다운로드 없음)
+- [ ] 모델·토크나이저·설정이 전부 `model/` 상대 경로인가?
 - [ ] zip ≤ 10GB, 언팩 ≤ 32GB인가?
 - [ ] 신규 패키지 설치 ≤ 10분인가?
 - [ ] MP3/WAV/FLAC 등 다중 확장자·모노/스테레오·전화채널을 깨지 않는가?
-- [ ] 출력 5개 컬럼과 sample_submission ID 순서가 유지되는가?
+- [ ] `output/submission.csv`가 생성되고 5개 컬럼·sample_submission ID 순서가 유지되는가?
+- [ ] 파일 단위 예외 처리가 있어 한 샘플 실패에도 csv가 남는가?
 - [ ] 한쪽 성분 FAKE → 파일 FAKE 규칙과 fusion이 맞는가?
 
 하나라도 실패하면 해당 변경을 적용하지 말고, 한도 안으로 줄인 대안을 제시한다.
