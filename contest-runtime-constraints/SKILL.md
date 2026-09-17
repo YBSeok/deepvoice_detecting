@@ -1,6 +1,6 @@
 ---
 name: contest-runtime-constraints
-description: Enforces the AI-generated audio detection contest runtime, size, hardware, offline, input, and output constraints. Use when implementing, modifying, reviewing, or optimizing the deepvoice baseline, script.py, submit.zip, model loading, from_pretrained, HuggingFace Hub, inference, PANNs, HTDemucs, DF-Arena, fusion, or submission.csv.
+description: Enforces the AI-generated audio detection contest runtime, size, hardware, offline, input, and output constraints. Use when implementing, modifying, reviewing, or optimizing the deepvoice baseline, script.py, submit.zip, model loading, from_pretrained, HuggingFace Hub, inference, PANNs, HTDemucs masks, DF-Arena, fusion, or submission.csv.
 ---
 
 # Contest Runtime Constraints
@@ -124,10 +124,11 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 L4 22.4GiB에서 모델 3개를 동시에 올리지 않는다. 베이스라인 패턴을 유지한다.
 
 1. PANNs Cnn14로 전 파일 presence 추론 → `del model` + `torch.cuda.empty_cache()`
-2. HTDemucs + DF-Arena 1B로 성분 분리·fake 추론
-3. HTDemucs 가중치는 CPU에 두고 `apply_model(..., device=cuda)`로 구간만 GPU에 올린다
-4. DF-Arena는 GPU 상주, 세그먼트 단위 추론
-5. 파일 하나 처리가 끝나면 해당 파형·분리 결과를 버린다
+2. HTDemucs는 CPU에서 프레임 풀링용 마스크만 추정. 재합성 파형은 인코더에 넣지 않는다
+3. 원본 믹스를 DF-Arena에 넣어 프레임 임베딩을 만든 뒤 마스크로 VF/MF 풀링
+4. HTDemucs 가중치는 CPU에 두고 `apply_model(..., device=cuda)`로 구간만 GPU에 올린다
+5. DF-Arena는 GPU 상주, 세그먼트 단위 추론
+6. 파일 하나 처리가 끝나면 해당 파형·마스크를 버린다
 
 금지:
 
@@ -146,21 +147,23 @@ L4 22.4GiB에서 모델 3개를 동시에 올리지 않는다. 베이스라인 �
 
 현재 파이프라인에서 비싼 구간:
 
-1. HTDemucs 분리 (가장 큼)
-2. DF-Arena 세그먼트 추론 × (voice + music)
+1. HTDemucs 마스크 추정 (가장 큼)
+2. DF-Arena 원본 믹스 세그먼트 인코딩 1회 + 프레임 풀링
 3. PANNs (32 kHz 리샘플 + 태그)
 
-최적화 우선순위: 분리 비용 감소 → fake 모델 중복 전방 계산 감소 → presence 모델 경량화. 정확도만 올리고 시간 한도를 깨는 변경은 거부한다.
+최적화 우선순위: 마스크 비용 감소 → fake 전방 계산 감소 → presence 모델 경량화. 정확도만 올리고 시간 한도를 깨는 변경은 거부한다.
 
 허용 예시:
 
 - Demucs `shifts=0`, `split=True` 유지 또는 더 싸게
-- 존재 확률이 매우 낮은 성분은 분리/fake 추론 스킵 (라벨 규칙과 모순되지 않게)
+- 존재 확률이 매우 낮은 성분은 fake 추론 스킵 (라벨 규칙과 모순되지 않게)
 - 모델을 더 작게, 또는 한 패스 공유 백본
+- 원본 파형은 그대로 두고 마스크는 임베딩 풀링에만 쓰기
 
 금지 예시:
 
 - Demucs `shifts≥1` 앙상블
+- 재합성 스템이나 마스크된 파형을 DF-Arena 입력으로 쓰기
 - 파일당 여러 분리 모델
 - 초당 수백 번 리샘플이 반복되는 파이썬 루프
 - 설치 10분을 넘는 conda 소스 빌드
@@ -209,8 +212,8 @@ zip ≤ 10GB, 언팩 ≤ 32GB. 새 가중치를 넣기 전에 추정한다.
 현재 제출 파이프라인의 기본값. 바꿀 때는 위 체크리스트를 다시 돈다.
 
 - 존재: PANNs Cnn14, 32 kHz, AudioSet voice/music 라벨 그룹 max
-- 분리: HTDemucs, vocals vs 나머지 합(accompaniment)
-- fake: DF-Arena 1B, spoof 라벨 softmax, 세그먼트 max
+- 마스크: HTDemucs vocals vs 나머지 합. 파형이 아니라 프레임 가중치로만 사용
+- fake: 원본 믹스를 DF-Arena 1B에 1회 인코딩한 뒤 마스크 풀링 + fc5
 - fusion: `FILE_FAKE_PROB = max(VP * VF, MP * MF)`
 - 리샘플 목표: 존재/fake 모두 16 kHz 원본 로드 후 모델별 변환
 - 장치는 CUDA. CUDA 없으면 실패시키는 것이 맞다 (평가 환경에 GPU가 있다)

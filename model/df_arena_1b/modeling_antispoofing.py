@@ -19,3 +19,6 @@ class DF_Arena_1B_Antispoofing(PreTrainedModel):
         # input_values: (batch, time) float32 waveform @ config.sample_rate
         logits = self.backbone(input_values)
         return {"logits": logits}
+
+    def encode_frames(self, input_values):
+        return self.backbone.encode_frames(input_values)

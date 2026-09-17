@@ -44,8 +44,12 @@ class DF_Arena_1B(nn.Module):
         return layery, fullfeature
 
     def forward(self, x):
-        out_ssl = self.ssl_model(x.unsqueeze(0)) #layerresult = [(x,z),24个] x(201,1,1024) z(1,201,201)
-        y0, fullfeature = self.get_attenF1D(out_ssl.hidden_states) 
+        output, _ = self.conformer(self._ssl_features(x))
+        return output
+
+    def _ssl_features(self, x):
+        out_ssl = self.ssl_model(x.unsqueeze(0))
+        y0, fullfeature = self.get_attenF1D(out_ssl.hidden_states)
         y0 = self.fc0(y0)
         y0 = self.sig(y0)
         y0 = y0.view(y0.shape[0], y0.shape[1], y0.shape[2], -1)
@@ -54,9 +58,8 @@ class DF_Arena_1B(nn.Module):
         fullfeature = fullfeature.unsqueeze(dim=1)
         fullfeature = self.first_bn(fullfeature)
         fullfeature = self.selu(fullfeature)
+        return fullfeature.squeeze(1)
 
-
-        output, _ = self.conformer(fullfeature.squeeze(1))
-
-
-        return output
+    def encode_frames(self, x):
+        _, frames, _ = self.conformer.forward_tokens(self._ssl_features(x))
+        return frames

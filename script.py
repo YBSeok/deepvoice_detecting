@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""경진대회 테스트 데이터에 대한 5개 확률값을 생성한다."""
+"""경진대회 테스트 데이터에 대한 5개 확률값을 생성한다.
+
+VP/MP는 원본 믹스의 PANNs. VF/MF는 원본 믹스를 DF-Arena에 넣은 뒤
+프레임 임베딩을 소스 마스크로만 나눠 풀링한다. 파형은 수정하지 않는다.
+FILE_FAKE_PROB만 네 헤드의 융합이다.
+"""
 
 import argparse
 import csv
@@ -40,6 +45,7 @@ AUDIO_SAMPLE_RATE = 16_000
 PANNS_SAMPLE_RATE = 32_000
 SEGMENT_SAMPLES = 64_600
 SILENCE_RMS = 1e-5
+MASK_SMOOTH_SAMPLES = 320
 
 PREDICTION_COLUMNS = [
     "FILE_FAKE_PROB",
@@ -48,6 +54,14 @@ PREDICTION_COLUMNS = [
     "VOICE_PRESENT_PROB",
     "MUSIC_PRESENT_PROB",
 ]
+
+# 4개 헤드가 직접 예측하는 필드. FILE_FAKE_PROB는 이 네 값의 융합이다.
+TASK_HEAD_COLUMNS = (
+    "VOICE_PRESENT_PROB",
+    "MUSIC_PRESENT_PROB",
+    "VOICE_FAKE_PROB",
+    "MUSIC_FAKE_PROB",
+)
 
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma"
@@ -60,7 +74,7 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Run the zero-shot audio deepfake baseline."
+        description="Encode the original mix, pool frames with source masks, fuse FILE_FAKE_PROB."
     )
     parser.add_argument("--test-dir", type=Path, default=DEFAULT_TEST_DIR)
     parser.add_argument(
@@ -176,7 +190,7 @@ def extract_segment(audio, start):
 
 
 # -----------------------------------------------------------------------------
-# 3. PANNs를 이용한 음성·음악 존재 여부 추론
+# 3. Presence heads (VP, MP)
 # -----------------------------------------------------------------------------
 
 def prepare_panns_labels():
@@ -217,39 +231,23 @@ def make_panns_segments(audio):
     return np.stack(segments)
 
 
-def predict_presence(model, voice_indices, music_indices, audio):
+def predict_presence_heads(model, voice_indices, music_indices, audio):
+    """Presence heads: PANNs 태그에서 음성·음악 그룹 최댓값을 확률로 쓴다."""
     segments = make_panns_segments(audio)
     predictions, _ = model.inference(segments)
-    voice_probability = float(predictions[:, voice_indices].max())
-    music_probability = float(predictions[:, music_indices].max())
-    return voice_probability, music_probability
-
-
-def predict_presence_for_all_files(audio_files, device):
-    model, voice_indices, music_indices = load_panns_model(device)
-    presence_scores = {}
-
-    for audio_path in tqdm(audio_files, desc="Presence"):
-        audio = load_audio(audio_path)
-        presence_scores[audio_path.stem] = predict_presence(
-            model, voice_indices, music_indices, audio
-        )
-
-    del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return presence_scores
+    voice_present = float(predictions[:, voice_indices].max())
+    music_present = float(predictions[:, music_indices].max())
+    return voice_present, music_present
 
 
 # -----------------------------------------------------------------------------
-# 4. HTDemucs를 이용한 음성·음악 분리
+# 4. 소스 마스크 (파형은 바꾸지 않고 프레임 가중치만 만듦)
 # -----------------------------------------------------------------------------
 
 def load_htdemucs_model():
     original_torch_load = torch.load
 
     def load_trusted_checkpoint(*args, **kwargs):
-        # PyTorch 2.6부터 바뀐 기본값에 맞춰 기존 체크포인트를 불러온다.
         kwargs.setdefault("weights_only", False)
         return original_torch_load(*args, **kwargs)
 
@@ -261,7 +259,7 @@ def load_htdemucs_model():
     return model.cpu().eval()
 
 
-def separate_voice_and_music(audio_path, model, device):
+def estimate_source_stems(audio_path, model, device):
     waveform = load_track(
         audio_path, model.audio_channels, model.samplerate
     ).float()
@@ -308,8 +306,42 @@ def separate_voice_and_music(audio_path, model, device):
     )
 
 
+def smooth_envelope(audio, win=MASK_SMOOTH_SAMPLES):
+    magnitude = np.abs(audio.astype(np.float64, copy=False))
+    if magnitude.size == 0 or magnitude.size < win:
+        return magnitude
+    kernel = np.ones(win, dtype=np.float64) / win
+    return np.convolve(magnitude, kernel, mode="same")
+
+
+def downsample_weights(values, num_frames):
+    values = np.asarray(values, dtype=np.float64)
+    if num_frames <= 0:
+        return np.zeros(0, dtype=np.float64)
+    if values.size == 0:
+        return np.zeros(num_frames, dtype=np.float64)
+    if values.size == 1:
+        return np.full(num_frames, float(values[0]), dtype=np.float64)
+    source = np.linspace(0.0, 1.0, num=values.size)
+    target = np.linspace(0.0, 1.0, num=num_frames)
+    return np.interp(target, source, values)
+
+
+def pooled_spoof_probability(frames, weights, classifier, fake_label_index):
+    weights = torch.as_tensor(
+        weights, device=frames.device, dtype=frames.dtype
+    ).clamp(min=0)
+    if float(weights.sum()) < 1e-6:
+        return 0.0
+    weights = weights / weights.sum()
+    pooled = (frames[0] * weights.unsqueeze(-1)).sum(dim=0, keepdim=True)
+    logits = classifier(pooled)
+    probabilities = torch.softmax(logits.float(), dim=-1)
+    return float(probabilities[0, fake_label_index])
+
+
 # -----------------------------------------------------------------------------
-# 5. DF-Arena 1B를 이용한 성분별 Fake 추론
+# 5. Fake heads (VF, MF)
 # -----------------------------------------------------------------------------
 
 def load_df_arena_model(device):
@@ -337,63 +369,153 @@ def calculate_rms(audio):
     return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
 
 
-def predict_fake(model, fake_label_index, audio, device):
-    if calculate_rms(audio) < SILENCE_RMS:
-        return 0.0
-
-    segment_scores = []
-    for start in get_segment_starts(audio.size):
-        segment = extract_segment(audio, start)
-        segment_tensor = torch.from_numpy(segment).to(device)
-
-        with torch.inference_mode():
-            logits = model(input_values=segment_tensor)["logits"]
-            probabilities = torch.softmax(logits.float(), dim=-1)
-        segment_scores.append(float(probabilities[0, fake_label_index]))
-
-    return max(segment_scores)
-
-
-# -----------------------------------------------------------------------------
-# 6. 파일 단위 점수 계산 및 제출 파일 저장
-# -----------------------------------------------------------------------------
-
-def combine_file_fake_score(voice_fake, music_fake, voice_present, music_present):
-    voice_score = voice_present * voice_fake
-    music_score = music_present * music_fake
-    return max(voice_score, music_score)
-
-
-def predict_fake_scores_for_all_files(
-    audio_files, submission_rows, presence_scores, device
+def predict_component_fake(
+    model, fake_label_index, mix, voice_stem, music_stem, device
 ):
-    df_arena_model, fake_label_index = load_df_arena_model(device)
-    htdemucs_model = load_htdemucs_model()
+    """원본 믹스만 인코딩하고, 마스크는 프레임 풀링에만 쓴다."""
+    length = min(mix.size, voice_stem.size, music_stem.size)
+    mix = mix[:length]
+    voice_env = smooth_envelope(voice_stem[:length])
+    music_env = smooth_envelope(music_stem[:length])
+    classifier = model.backbone.conformer.fc5
 
-    for index, audio_path in enumerate(tqdm(audio_files, desc="Components")):
-        voice_audio, music_audio = separate_voice_and_music(
-            audio_path, htdemucs_model, device
-        )
-        voice_fake = predict_fake(
-            df_arena_model, fake_label_index, voice_audio, device
-        )
-        music_fake = predict_fake(
-            df_arena_model, fake_label_index, music_audio, device
-        )
+    voice_scores = []
+    music_scores = []
+    for start in get_segment_starts(mix.size):
+        segment = extract_segment(mix, start)
+        voice_seg = extract_segment(voice_env.astype(np.float32), start)
+        music_seg = extract_segment(music_env.astype(np.float32), start)
+        if calculate_rms(segment) < SILENCE_RMS:
+            continue
 
-        voice_present, music_present = presence_scores[audio_path.stem]
-        file_fake = combine_file_fake_score(
-            voice_fake, music_fake, voice_present, music_present
-        )
+        segment_tensor = torch.from_numpy(segment).to(device)
+        with torch.inference_mode():
+            frames = model.encode_frames(segment_tensor)
+            num_frames = int(frames.shape[1])
+            voice_weights = downsample_weights(voice_seg, num_frames)
+            music_weights = downsample_weights(music_seg, num_frames)
+            voice_scores.append(
+                pooled_spoof_probability(
+                    frames, voice_weights, classifier, fake_label_index
+                )
+            )
+            music_scores.append(
+                pooled_spoof_probability(
+                    frames, music_weights, classifier, fake_label_index
+                )
+            )
 
-        row = submission_rows[index]
-        row["FILE_FAKE_PROB"] = round(file_fake, 10)
-        row["VOICE_FAKE_PROB"] = round(voice_fake, 10)
-        row["MUSIC_FAKE_PROB"] = round(music_fake, 10)
-        row["VOICE_PRESENT_PROB"] = round(voice_present, 10)
-        row["MUSIC_PRESENT_PROB"] = round(music_present, 10)
+    voice_fake = max(voice_scores) if voice_scores else 0.0
+    music_fake = max(music_scores) if music_scores else 0.0
+    return voice_fake, music_fake
 
-    return submission_rows
+
+# -----------------------------------------------------------------------------
+# 6. 헤드 예측 및 제출 파일 저장
+# -----------------------------------------------------------------------------
+
+def empty_head_outputs():
+    return {column: 0.0 for column in TASK_HEAD_COLUMNS}
+
+
+def fuse_file_fake(head_outputs):
+    """FILE_FAKE_PROB는 5번째 헤드가 아니라 4개 헤드 출력의 융합이다."""
+    voice_risk = (
+        head_outputs["VOICE_PRESENT_PROB"] * head_outputs["VOICE_FAKE_PROB"]
+    )
+    music_risk = (
+        head_outputs["MUSIC_PRESENT_PROB"] * head_outputs["MUSIC_FAKE_PROB"]
+    )
+    return max(voice_risk, music_risk)
+
+
+def write_prediction_row(row, head_outputs):
+    for column, value in head_outputs.items():
+        row[column] = round(value, 10)
+    row["FILE_FAKE_PROB"] = round(fuse_file_fake(head_outputs), 10)
+
+
+class FourHeadPredictor:
+    """원본 믹스에서 5개 필드를 만든다.
+
+    Head VP: PANNs 음성 라벨 그룹 → VOICE_PRESENT_PROB
+    Head MP: PANNs 음악 라벨 그룹 → MUSIC_PRESENT_PROB
+    Head VF/MF: 원본 믹스 인코딩 후 프레임을 보컬/음악 마스크로 풀링
+
+    FILE_FAKE_PROB = max(VP × VF, MP × MF)
+    """
+
+    def __init__(self, device):
+        self.device = device
+
+    def run_presence_heads(self, audio_files):
+        model, voice_indices, music_indices = load_panns_model(self.device)
+        presence_scores = {}
+
+        for audio_path in tqdm(audio_files, desc="Heads VP/MP"):
+            try:
+                audio = load_audio(audio_path)
+                voice_present, music_present = predict_presence_heads(
+                    model, voice_indices, music_indices, audio
+                )
+                presence_scores[audio_path.stem] = {
+                    "VOICE_PRESENT_PROB": voice_present,
+                    "MUSIC_PRESENT_PROB": music_present,
+                }
+            except Exception:
+                presence_scores[audio_path.stem] = {
+                    "VOICE_PRESENT_PROB": 0.0,
+                    "MUSIC_PRESENT_PROB": 0.0,
+                }
+
+        del model
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return presence_scores
+
+    def run_fake_heads(self, audio_files, presence_scores):
+        df_arena_model, fake_label_index = load_df_arena_model(self.device)
+        htdemucs_model = load_htdemucs_model()
+        head_outputs_by_id = {}
+
+        for audio_path in tqdm(audio_files, desc="Heads VF/MF"):
+            head_outputs = empty_head_outputs()
+            head_outputs.update(presence_scores.get(audio_path.stem, {}))
+            try:
+                mix = load_audio(audio_path)
+                voice_stem, music_stem = estimate_source_stems(
+                    audio_path, htdemucs_model, self.device
+                )
+                voice_fake, music_fake = predict_component_fake(
+                    df_arena_model,
+                    fake_label_index,
+                    mix,
+                    voice_stem,
+                    music_stem,
+                    self.device,
+                )
+                head_outputs["VOICE_FAKE_PROB"] = voice_fake
+                head_outputs["MUSIC_FAKE_PROB"] = music_fake
+            except Exception:
+                pass
+            head_outputs_by_id[audio_path.stem] = head_outputs
+
+        del df_arena_model
+        del htdemucs_model
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return head_outputs_by_id
+
+    def predict(self, audio_files, submission_rows):
+        presence_scores = self.run_presence_heads(audio_files)
+        head_outputs_by_id = self.run_fake_heads(audio_files, presence_scores)
+
+        for index, audio_path in enumerate(audio_files):
+            write_prediction_row(
+                submission_rows[index],
+                head_outputs_by_id[audio_path.stem],
+            )
+        return submission_rows
 
 
 def save_submission(output_path, column_names, rows):
@@ -413,15 +535,11 @@ def main():
     column_names, submission_rows = read_sample_submission(args.sample_submission)
     audio_files = order_audio_files(audio_files, submission_rows)
 
-    # 2. 파일별 음성·음악 존재 확률을 계산한다.
-    presence_scores = predict_presence_for_all_files(audio_files, device)
+    # 2. VP/MP는 믹스, VF/MF는 원본 인코딩 + 프레임 풀링, FILE_FAKE만 융합한다.
+    predictor = FourHeadPredictor(device)
+    submission_rows = predictor.predict(audio_files, submission_rows)
 
-    # 3. 음성과 음악을 분리한 뒤 성분별 Fake 확률을 계산한다.
-    submission_rows = predict_fake_scores_for_all_files(
-        audio_files, submission_rows, presence_scores, device
-    )
-
-    # 4. 5개 예측값을 제출 파일로 저장한다.
+    # 3. 5개 예측값을 제출 파일로 저장한다.
     save_submission(args.output, column_names, submission_rows)
     print(f"Saved {len(submission_rows)} predictions to {args.output}")
 

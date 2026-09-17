@@ -271,14 +271,17 @@ class FinalConformer(nn.Module):
     self.class_token = nn.Parameter(torch.rand(1, emb_size))
     self.fc5 = nn.Linear(emb_size, 2)
 
-  def forward(self, x): # x shape [bs, tiempo, frecuencia]
+  def forward_tokens(self, x):
     x = x + self.positional_emb[:, :x.size(1), :]
-    x = torch.stack([torch.vstack((self.class_token, x[i])) for i in range(len(x))])#[bs,1+tiempo,emb_size]
+    x = torch.stack([torch.vstack((self.class_token, x[i])) for i in range(len(x))])
     list_attn_weight = []
     for layer in self.encoder_blocks:
-            x, attn_weight = layer(x) #[bs,1+tiempo,emb_size]
+            x, attn_weight = layer(x)
             list_attn_weight.append(attn_weight)
-    embedding=x[:,0,:] #[bs, emb_size]
+    return x[:, 0, :], x[:, 1:, :], list_attn_weight
+
+  def forward(self, x): # x shape [bs, tiempo, frecuencia]
+    embedding, _, list_attn_weight = self.forward_tokens(x)
     out=self.fc5(embedding) #[bs,2]
     return out, list_attn_weight
 
