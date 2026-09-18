@@ -12,18 +12,15 @@
   Fake_Music_Only / 오버레이 -> 부분 fake 혼합 포함
   VF 헤드: 음성 있는 클립만 (Libri vs TTS_ko, 오버레이 포함)
 
-# 로컬 학습 (폴더당 400클립)
-python train_v2.py --train-csv data/manifests/train.csv --valid-csv data/manifests/valid.csv --ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt --max-per-source 400 --voice-per-source 1200 --overlays 400
+# 로컬 학습 (폴더당 400클립, Zeroth/Phone 1200, 전화 왜곡 30%)
+python train_v2.py --train-csv data/manifests/train.csv --valid-csv data/manifests/valid.csv --ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt --max-per-source 400 --voice-per-source 1200 --overlays 400 --phone-frac 0.3
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import hashlib
 import os
 import shutil
-import sys
 from pathlib import Path
 
 import librosa
@@ -34,6 +31,15 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from heads.music_fake import EMBED_DIM, MusicFakeHead
+from learning_data import (
+    AUDIO_SAMPLE_RATE,
+    add_all_overlays,
+    add_phone_rows,
+    cache_key,
+    load_row_audio,
+    music_rows,
+    read_csv_rows,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -43,12 +49,7 @@ PANNS_DIR = MODEL_DIR / "panns"
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-AUDIO_SAMPLE_RATE = 16_000
 PANNS_SAMPLE_RATE = 32_000
-SEGMENT_SAMPLES = 64_600
-REAL_RULES = {"Music_Only", "Voice_and_Music", "Voice_Only", "Fake_Voice_Only"}
-FAKE_RULES = {"Fake_Music_Only"}
-TRAIN_RULES = REAL_RULES | FAKE_RULES
 
 
 def prepare_panns_labels():
@@ -68,134 +69,6 @@ def load_panns(device):
     )
 
 
-def read_csv_rows(path: Path):
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
-        return list(csv.DictReader(file))
-
-
-def row_limit(row, max_per_source, voice_per_source):
-    source = row.get("source_folder", "")
-    if "Zeroth" in source and voice_per_source:
-        return voice_per_source
-    return max_per_source
-
-
-def music_rows(rows, max_per_source=None, voice_per_source=None):
-    selected = [row for row in rows if row.get("rule") in TRAIN_RULES]
-    if not max_per_source:
-        return selected
-    counts = {}
-    capped = []
-    for row in selected:
-        source = row.get("source_folder", "")
-        limit = row_limit(row, max_per_source, voice_per_source)
-        counts[source] = counts.get(source, 0) + 1
-        if counts[source] <= limit:
-            capped.append(row)
-    return capped
-
-
-def load_audio(path):
-    audio, _ = librosa.load(path, sr=AUDIO_SAMPLE_RATE, mono=True, dtype=np.float32)
-    if audio.size == 0 or not np.isfinite(audio).all():
-        return np.zeros(SEGMENT_SAMPLES, dtype=np.float32)
-    if audio.size < SEGMENT_SAMPLES:
-        repeat_count = SEGMENT_SAMPLES // max(audio.size, 1) + 1
-        return np.tile(audio, repeat_count)[:SEGMENT_SAMPLES]
-    return audio[:SEGMENT_SAMPLES]
-
-
-def peak_norm(audio, peak=0.8):
-    mag = float(np.max(np.abs(audio)))
-    if mag < 1e-6:
-        return audio
-    return audio / mag * peak
-
-
-def overlay_audio(voice, music):
-    length = min(voice.size, music.size)
-    mix = peak_norm(voice[:length]) + peak_norm(music[:length])
-    return peak_norm(mix, 0.9).astype(np.float32)
-
-
-def make_overlay_rows(
-    rows,
-    count,
-    seed,
-    voice_rule,
-    music_rule,
-    voice_fake,
-    music_fake,
-    name,
-    voice_folder=None,
-):
-    voices = [row for row in rows if row.get("rule") == voice_rule]
-    if voice_folder:
-        voices = [row for row in voices if row.get("source_folder") == voice_folder]
-    musics = [row for row in rows if row.get("rule") == music_rule]
-    if count <= 0 or not voices or not musics:
-        return []
-    rng = np.random.default_rng(seed)
-    overlays = []
-    for _ in range(count):
-        voice = voices[int(rng.integers(0, len(voices)))]
-        music = musics[int(rng.integers(0, len(musics)))]
-        overlays.append(
-            {
-                "path": f"overlay::{name}::{voice['path']}::{music['path']}",
-                "voice_path": voice["path"],
-                "music_path": music["path"],
-                "VOICE_PRESENT": 1,
-                "MUSIC_PRESENT": 1,
-                "VOICE_FAKE": voice_fake,
-                "MUSIC_FAKE": music_fake,
-                "source_folder": name,
-                "rule": name,
-            }
-        )
-    return overlays
-
-
-def add_all_overlays(rows, count, seed):
-    extras = []
-    extras.extend(
-        make_overlay_rows(rows, count, seed, "Voice_Only", "Fake_Music_Only", 0, 1, "overlay_rv_fm")
-    )
-    extras.extend(
-        make_overlay_rows(rows, count, seed + 1, "Fake_Voice_Only", "Music_Only", 1, 0, "overlay_fv_rm")
-    )
-    extras.extend(
-        make_overlay_rows(rows, count, seed + 2, "Fake_Voice_Only", "Fake_Music_Only", 1, 1, "overlay_fv_fm")
-    )
-    extras.extend(
-        make_overlay_rows(
-            rows,
-            count,
-            seed + 3,
-            "Voice_Only",
-            "Fake_Music_Only",
-            0,
-            1,
-            "overlay_ko_fm",
-            voice_folder="Voice_Only_Zeroth",
-        )
-    )
-    extras.extend(
-        make_overlay_rows(
-            rows,
-            count,
-            seed + 4,
-            "Voice_Only",
-            "Music_Only",
-            0,
-            0,
-            "overlay_ko_rm",
-            voice_folder="Voice_Only_Zeroth",
-        )
-    )
-    return extras
-
-
 def panns_embedding(model, audio):
     resampled = librosa.resample(
         audio,
@@ -210,19 +83,6 @@ def panns_embedding(model, audio):
     return torch.from_numpy(vector.copy())
 
 
-def cache_key(row):
-    raw = row["path"]
-    digest = hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
-    name = Path(row.get("voice_path", raw)).stem
-    return f"{name}_{digest}.pt"
-
-
-def load_row_audio(row):
-    if str(row.get("rule", "")).startswith("overlay"):
-        return overlay_audio(load_audio(row["voice_path"]), load_audio(row["music_path"]))
-    return load_audio(row["path"])
-
-
 def embed_rows(rows, model, cache_dir: Path):
     cache_dir.mkdir(parents=True, exist_ok=True)
     embeddings = []
@@ -234,7 +94,11 @@ def embed_rows(rows, model, cache_dir: Path):
         if cache_path.is_file():
             vector = torch.load(cache_path, map_location="cpu", weights_only=True)
         else:
-            vector = panns_embedding(model, load_row_audio(row))
+            try:
+                vector = panns_embedding(model, load_row_audio(row))
+            except Exception as exc:
+                print(f"skip {row.get('path')}: {exc}")
+                continue
             torch.save(vector, cache_path)
         embeddings.append(vector)
         music_labels.append(float(row["MUSIC_FAKE"]))
@@ -394,9 +258,15 @@ def parse_args():
         "--voice-per-source",
         type=int,
         default=1200,
-        help="Voice_Only_Zeroth(한국어 실음성) 캡. TTS 오탐을 줄이려고 영어 Libri보다 많이 넣는다.",
+        help="Zeroth·Phone 한국어 실음성 캡. TTS/전화 오탐을 줄이려고 영어 Libri보다 많이 넣는다.",
     )
     parser.add_argument("--overlays", type=int, default=400)
+    parser.add_argument(
+        "--phone-frac",
+        type=float,
+        default=0.3,
+        help="이미 전화인 Phone 폴더를 제외하고, 그 비율만큼 8 kHz 왕복 복사본을 넣는다.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     return parser.parse_args()
@@ -417,6 +287,8 @@ def main():
     valid_rows = music_rows(read_csv_rows(args.valid_csv), cap, voice_cap)
     train_rows.extend(add_all_overlays(train_rows, args.overlays, args.seed))
     valid_rows.extend(add_all_overlays(valid_rows, max(args.overlays // 10, 0), args.seed + 1))
+    train_rows.extend(add_phone_rows(train_rows, args.phone_frac, args.seed + 99))
+    valid_rows.extend(add_phone_rows(valid_rows, args.phone_frac, args.seed + 100))
     if not train_rows:
         raise SystemExit("학습 클립이 없습니다. 매니페스트 규칙을 확인하세요.")
 

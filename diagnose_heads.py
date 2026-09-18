@@ -44,6 +44,7 @@ PROBE_DIR = Path("data") / "probe"
 SOURCES = {
     "real_voice": Path(r"D:\Voice_Only_LibriSpeech"),
     "real_voice_ko": Path(r"D:\Voice_Only_Zeroth"),
+    "real_voice_phone": Path(r"D:\Voice_Only_Phone"),
     "real_music": Path(r"D:\Music_Only_FMA"),
     "fake_music": Path(r"D:\Fake_Music_Only_Suno"),
     "real_mix": Path(r"D:\Voice_and_Music_FMA"),
@@ -54,6 +55,7 @@ SOURCES = {
 EXPECTED = {
     "real_voice": {"VF": 0, "MF": 0, "FILE": 0},
     "real_voice_ko": {"VF": 0, "MF": 0, "FILE": 0},
+    "real_voice_phone": {"VF": 0, "MF": 0, "FILE": 0},
     "real_music": {"VF": 0, "MF": 0, "FILE": 0},
     "fake_music": {"VF": 0, "MF": 1, "FILE": 1},
     "real_mix": {"VF": 0, "MF": 0, "FILE": 0},
@@ -111,7 +113,9 @@ def build_probe(per_case, seed):
     rng = random.Random(seed)
     cases = defaultdict(list)
 
-    for name in ("real_voice", "real_voice_ko", "real_music", "fake_music", "real_mix", "fake_voice"):
+    for name in ("real_voice", "real_voice_ko", "real_voice_phone", "real_music", "fake_music", "real_mix", "fake_voice"):
+        if name not in SOURCES or not SOURCES[name].is_dir():
+            continue
         folder = PROBE_DIR / name
         folder.mkdir(parents=True, exist_ok=True)
         chosen = pick(list_audio(SOURCES[name]), per_case, rng)
@@ -209,7 +213,7 @@ def diagnose(summary):
         else:
             print("- 혼합(진짜음성+가짜음악): MF/FILE은 동작")
     real_fp = []
-    for name in ("real_voice", "real_voice_ko", "real_music", "real_mix"):
+    for name in ("real_voice", "real_voice_ko", "real_voice_phone", "real_music", "real_mix"):
         row = summary.get(name)
         if row and row["FILE"] >= 0.5:
             real_fp.append(name)
@@ -221,6 +225,14 @@ def diagnose(summary):
             print("- 오탐: 한국어 실음성(Zeroth)에서 VF가 높음")
         else:
             print("- 한국어 실음성(Zeroth): VF 오탐은 낮음")
+    phone = summary.get("real_voice_phone")
+    if phone:
+        if phone["VF"] >= 0.5:
+            print("- 오탐: 전화 실음성에서 VF가 높음")
+        elif phone["MF"] >= 0.5:
+            print("- 오탐: 전화 실음성에서 MF가 높음")
+        else:
+            print("- 전화 실음성: VF/MF 오탐은 낮음")
     mix_ko = summary.get("mix_ko_fm")
     if mix_ko:
         if mix_ko["MF"] < 0.5:

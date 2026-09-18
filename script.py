@@ -2,9 +2,10 @@
 """경진대회 테스트 데이터에 대한 5개 확률값을 생성한다.
 
 VP/MP: 원본 믹스 → PANNs
-VF: 원본 믹스 → PANNs VF 헤드, DF-Arena가 되면 max
+VF: DF-Arena와 학습 PANNs VF를 양방향 게이트.
+     한쪽만 높으면 낮은 쪽 신뢰도로만 반영 (DF 단독 오탐·PANNs 단독 오탐 억제)
 MF: 원본 믹스 → PANNs 임베딩 → 학습된 MF 헤드
-FILE_FAKE_PROB = max(VP × VF, MP × MF)
+FILE_FAKE_PROB = 1 - (1 - VP×VF)(1 - MP×MF)  (noisy-OR)
 """
 
 import argparse
@@ -501,14 +502,38 @@ def empty_head_outputs():
 
 
 def fuse_file_fake(head_outputs):
-    """FILE_FAKE_PROB는 5번째 헤드가 아니라 4개 헤드 출력의 융합이다."""
+    """FILE_FAKE = noisy-OR(VP×VF, MP×MF).
+
+    max만 쓰면 한쪽 성분이 중강도일 때(특히 혼합) FILE이 과소평가된다.
+    라벨 규칙(한쪽이라도 FAKE면 파일 FAKE)에 더 가깝게, 두 위험을 합성한다.
+    """
     voice_risk = (
         head_outputs["VOICE_PRESENT_PROB"] * head_outputs["VOICE_FAKE_PROB"]
     )
     music_risk = (
         head_outputs["MUSIC_PRESENT_PROB"] * head_outputs["MUSIC_FAKE_PROB"]
     )
-    return max(voice_risk, music_risk)
+    return 1.0 - (1.0 - voice_risk) * (1.0 - music_risk)
+
+
+def fuse_voice_fake(panns_vf, df_vf):
+    """DF-Arena와 PANNs VF를 양방향 게이트로 합친다.
+
+    DF-Arena 가중치는 고정이므로 재학습 대신 사용 방식만 바꾼다.
+
+    - max(panns, df): 실음성/전화/실믹스 오탐의 합집합 (ADS↓)
+    - df + (panns-df)*df (이전): PANNs가 DF를 올릴 수만 있고, DF 오탐은 못 깎음
+    - 양방향: 높은 쪽은 낮은 쪽을 게이트로만 가산
+        panns >= df → df + (panns-df)*df
+        df > panns  → panns + (df-panns)*panns
+
+    전화·실믹스처럼 학습 헤드(PANNs)는 낮은데 DF만 높은 경우 VF가 내려간다.
+    """
+    panns_vf = float(panns_vf)
+    df_vf = float(df_vf)
+    if panns_vf >= df_vf:
+        return df_vf + (panns_vf - df_vf) * df_vf
+    return panns_vf + (df_vf - panns_vf) * panns_vf
 
 
 def write_prediction_row(row, head_outputs):
@@ -522,10 +547,11 @@ class FourHeadPredictor:
 
     Head VP: PANNs 음성 라벨 그룹 → VOICE_PRESENT_PROB
     Head MP: PANNs 음악 라벨 그룹 → MUSIC_PRESENT_PROB
-    Head VF: PANNs VF 헤드 (+ DF-Arena가 되면 max)
+    Head VF: DF-Arena + (동의할 때만) PANNs VF
     Head MF: PANNs MF 헤드
 
-    FILE_FAKE_PROB = max(VP × VF, MP × MF)
+    FILE_FAKE_PROB = 1 - (1 - VP×VF)(1 - MP×MF)
+    VF = bidirectional gate(PANNs VF, DF-Arena)
     """
 
     def __init__(self, device, mf_ckpt, vf_ckpt, vf_device=None):
@@ -634,10 +660,15 @@ class FourHeadPredictor:
         for audio_path in audio_files:
             head_outputs = empty_head_outputs()
             head_outputs.update(presence_scores.get(audio_path.stem, {}))
-            head_outputs["VOICE_FAKE_PROB"] = max(
-                panns_vf.get(audio_path.stem, 0.0),
-                df_vf.get(audio_path.stem, 0.0),
-            )
+            panns_score = panns_vf.get(audio_path.stem, 0.0)
+            df_score = df_vf.get(audio_path.stem, 0.0)
+            if skip_vf:
+                head_outputs["VOICE_FAKE_PROB"] = panns_score
+            else:
+                head_outputs["VOICE_FAKE_PROB"] = fuse_voice_fake(
+                    panns_score,
+                    df_score,
+                )
             head_outputs["MUSIC_FAKE_PROB"] = music_fakes.get(audio_path.stem, 0.0)
             head_outputs_by_id[audio_path.stem] = head_outputs
         return head_outputs_by_id
@@ -671,7 +702,7 @@ def main():
     column_names, submission_rows = read_sample_submission(args.sample_submission)
     audio_files = order_audio_files(audio_files, submission_rows)
 
-    # 2. VP/MP는 믹스, VF/MF는 PANNs 헤드, DF-Arena VF는 가능하면 max로 합친다.
+    # 2. VP/MP는 믹스, MF는 PANNs 헤드, VF는 DF-Arena 기본 + 동의할 때만 PANNs 가산.
     vf_name = args.device if args.vf_device == "auto" else args.vf_device
     vf_device = torch.device("cpu") if vf_name == "cpu" else select_device(vf_name)
     predictor = FourHeadPredictor(device, args.mf_ckpt, args.vf_ckpt, vf_device)

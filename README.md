@@ -8,11 +8,51 @@ AI 생성 음성·음악 탐지. 제출 필드 5개: `FILE_FAKE`, `VOICE_FAKE`, 
 
 | 버전 | 날짜 | 점수 | 비고 |
 |------|------|------|------|
-| v2 | 2026-09-18 | | PANNs VF/MF 헤드 + DF-Arena VF max |
+| v2.2 | 2026-09-18 | | VF 양방향 게이트 + FILE noisy-OR. 전화·실믹스 DF 오탐 억제 |
+| v2.1 | 2026-09-18 | | VF: DF 기본, PANNs는 DF도 높을 때만 가산 (DF 오탐은 못 깎음) |
+| v2 | 2026-09-18 | 0.684 | PANNs VF/MF + DF-Arena VF `max`. ADS 하락 |
 | v1 | 2026-09-17 | | 원본 믹스 인코딩 + 마스크 풀링 |
 | v0 | | | 베이스라인 (PANNs + Demucs 스템 + DF-Arena) |
 
+## 제출
+
+```text
+submit.zip  ← script.py + requirements.txt + model/ (PANNs, HTDemucs, DF-Arena, mf_head.pt, vf_head.pt)
+```
+
+로컬 학습·추론:
+
+```bash
+.\.venv\Scripts\python.exe train_v2.py --train-csv data/manifests/train.csv --valid-csv data/manifests/valid.csv --ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt --max-per-source 400 --voice-per-source 1200 --overlays 400 --phone-frac 0.3
+
+.\.venv\Scripts\python.exe script.py --test-dir data/test --sample-submission data/sample_submission.csv --output output/submission.csv
+```
+
+프로브 진단:
+
+```bash
+.\.venv\Scripts\python.exe diagnose_heads.py --per-case 8 --run-vf --vf-device cuda
+```
+
 ## 변경 이력
+
+### v2.2 — DF 오탐 억제 (fusion만 변경)
+
+DF-Arena 가중치는 고정(오픈 체크포인트). 재학습 대신 **점수 결합**만 바꿈.
+
+- VF: 양방향 게이트
+  - `panns ≥ df` → `df + (panns−df)·df` (이전과 동일, 가산)
+  - `df > panns` → `panns + (df−panns)·panns` (**DF만 높은 오탐 억제**)
+- FILE: `1 − (1−VP×VF)(1−MP×MF)` (noisy-OR). 혼합에서 `max`만 쓸 때 과소평가되던 경우 보완
+- 학습 데이터: `Voice_Only_Phone` + Zeroth를 `voice-per-source`로 더 넣고, `phone-frac`으로 8 kHz 왕복 증강. PANNs VF는 전화·실믹스에서 이미 낮게 잘 봄 → fusion이 DF 오탐을 깎아 줘야 효과가 남
+
+로컬 프로브(케이스당 8클립) 요약: 전화 실음성 VF hit 0.50→0.88, 실믹스 VF hit 0.00→1.00. 가짜 음성 VF hit는 1.00→0.75로 소폭 희생.
+
+### v2.1 — 단방향 게이트
+
+- VF: `df + (max(panns, df)−df)·df`. PANNs는 DF가 높을 때만 가산
+- FILE: `max(VP×VF, MP×MF)`
+- DF 단독 오탐(전화·실믹스)은 그대로 통과함
 
 ### v2 — 학습된 VF/MF 헤드
 
@@ -20,8 +60,8 @@ AI 생성 음성·음악 탐지. 제출 필드 5개: `FILE_FAKE`, `VOICE_FAKE`, 
 
 - VP/MP: 믹스 → PANNs (v1과 동일)
 - MF: 믹스 → PANNs 임베딩 → `mf_head.pt`
-- VF: `max(PANNs vf_head, DF-Arena)`. DF-Arena는 v1처럼 믹스 인코딩 + 보컬 마스크 풀링
-- FILE_FAKE: `max(VP×VF, MP×MF)` (동일)
+- VF: DF-Arena + PANNs `vf_head`. v2는 `max(panns, df)` → 실음성 오탐 합집합으로 ADS 0.694→0.650
+- FILE_FAKE: `max(VP×VF, MP×MF)`
 
 학습에서 v1 대비 바꾼 점:
 
