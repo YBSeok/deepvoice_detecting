@@ -1,1 +1,14 @@
+--index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://pypi.org/simple
+librosa==1.0.0
+soxr==1.1.0
+soundfile==0.14.0
+numpy>=2.0
+tqdm
+torch
+torchaudio
+transformers
+einops
+demucs
+panns-inference
 matplotlib==3.9.2

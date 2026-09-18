@@ -19,6 +19,8 @@ model/**/*.msgpack
 *.zip
 output/
 data/test/
+data/manifests/
+data/cache/
 data/**/*.wav
 data/**/*.mp3
 data/**/*.flac
@@ -30,9 +32,15 @@ data/**/*.wma
 
 # Caches and local env
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .ipynb_checkpoints/
 .cache/
 .venv/
 venv/
+env/
 .env
+huggingface_cache/
+.hf_home/
+Thumbs.db
+Desktop.ini

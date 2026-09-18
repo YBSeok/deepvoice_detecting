@@ -1,29 +1,18 @@
 #!/usr/bin/env python3
-"""매니페스트로 4개 헤드를 학습하고, 같은 체크포인트로 추론한다.
+"""V1 실험용. V2 학습/추론은 아래를 쓴다.
 
-학습 전에 manifests/train.csv, valid.csv가 있어야 한다.
-  python -m preprocess.build_manifest --root <pjs> --alias Voice_Only_Zeroth_Korean=<zeroth> --out <pjs>/manifests
+python train_v2.py --train-csv data/manifests/train.csv --valid-csv data/manifests/valid.csv --ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt --max-per-source 400 --overlays 400
 
-# 로컬 학습 (폴더당 400클립, 첫 실험용)
-python train_heads.py --train-csv manifests/train.csv --valid-csv manifests/valid.csv --ckpt model/task_heads.pt --epochs 8 --batch-size 16 --max-per-source 400
-
-# 로컬 학습 (매니페스트 전체)
-python train_heads.py --train-csv manifests/train.csv --valid-csv manifests/valid.csv --ckpt model/task_heads.pt --epochs 8 --batch-size 16
-
-# Colab 학습
-# python train_heads.py --train-csv "/content/drive/Shareddrives/Korean Voice Datasets/pjs/manifests/train.csv" --valid-csv "/content/drive/Shareddrives/Korean Voice Datasets/pjs/manifests/valid.csv" --ckpt "/content/drive/Shareddrives/Korean Voice Datasets/pjs/model/task_heads.pt" --epochs 8 --batch-size 16 --max-per-source 400
-
-# 학습한 헤드로 추론
-python train_heads.py --predict --ckpt model/task_heads.pt --test-dir data/test --sample-submission data/sample_submission.csv --output output/submission.csv
-
-# 대회 베이스라인 추론 (이 파일이 아님, 모은 데이터를 쓰지 않음)
-# python script.py --test-dir data/test --sample-submission data/sample_submission.csv --output output/submission.csv
+python script.py --test-dir data/test --sample-submission data/sample_submission.csv --output output/submission.csv --mf-ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import os
+import sys
 from pathlib import Path
 
 import librosa
@@ -34,11 +23,16 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = BASE_DIR / "model"
+DF_ARENA_DIR = MODEL_DIR / "df_arena_1b"
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 SAMPLE_RATE = 16_000
 SEGMENT_SAMPLES = 64_600
-N_MELS = 64
-N_FFT = 1024
-HOP_LENGTH = 512
+EMBED_DIM = 1280
 LABEL_COLUMNS = (
     "VOICE_PRESENT",
     "MUSIC_PRESENT",
@@ -63,23 +57,37 @@ AUDIO_EXTENSIONS = {
 }
 
 
-class LogmelDataset(Dataset):
-    def __init__(self, rows, max_per_source=None):
-        if max_per_source:
-            rows = _cap_per_source(rows, max_per_source)
+class TaskHeads(nn.Module):
+    """고정된 DF-Arena 1280차원 임베딩 → 4개 필드."""
+
+    def __init__(self, dim=EMBED_DIM):
+        super().__init__()
+        self.heads = nn.Sequential(
+            nn.Linear(dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 4),
+        )
+
+    def forward(self, features):
+        return self.heads(features)
+
+
+class EmbeddingDataset(Dataset):
+    def __init__(self, rows, embeddings):
         self.rows = rows
+        self.embeddings = embeddings
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, index):
         row = self.rows[index]
-        features = load_logmel(row["path"])
         labels = torch.tensor(
             [float(row[column]) for column in LABEL_COLUMNS],
             dtype=torch.float32,
         )
-        return features, labels, row["ID"]
+        return self.embeddings[index], labels, row["ID"]
 
 
 def _cap_per_source(rows, limit):
@@ -98,47 +106,64 @@ def read_csv_rows(path: Path):
         return list(csv.DictReader(file))
 
 
-def load_logmel(path):
+def load_audio(path):
     audio, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True, dtype=np.float32)
     if audio.size == 0 or not np.isfinite(audio).all():
-        audio = np.zeros(SEGMENT_SAMPLES, dtype=np.float32)
+        return np.zeros(SEGMENT_SAMPLES, dtype=np.float32)
     if audio.size < SEGMENT_SAMPLES:
         repeat_count = SEGMENT_SAMPLES // max(audio.size, 1) + 1
-        audio = np.tile(audio, repeat_count)[:SEGMENT_SAMPLES]
-    else:
-        audio = audio[:SEGMENT_SAMPLES]
-    mel = librosa.feature.melspectrogram(
-        y=audio,
-        sr=SAMPLE_RATE,
-        n_fft=N_FFT,
-        hop_length=HOP_LENGTH,
-        n_mels=N_MELS,
-        power=2.0,
-    )
-    logmel = librosa.power_to_db(mel, ref=np.max).astype(np.float32)
-    logmel = np.clip((logmel + 80.0) / 80.0, 0.0, 1.0)
-    return torch.from_numpy(logmel).unsqueeze(0)
+        return np.tile(audio, repeat_count)[:SEGMENT_SAMPLES]
+    return audio[:SEGMENT_SAMPLES]
 
 
-class TaskHeads(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
+def cache_key(path: Path):
+    digest = hashlib.md5(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+    return f"{path.stem}_{digest}.pt"
+
+
+def load_df_arena(device):
+    if str(MODEL_DIR) not in sys.path:
+        sys.path.insert(0, str(MODEL_DIR))
+    from df_arena_1b.modeling_antispoofing import DF_Arena_1B_Antispoofing
+
+    previous_directory = Path.cwd()
+    os.chdir(DF_ARENA_DIR)
+    try:
+        model = DF_Arena_1B_Antispoofing.from_pretrained(
+            str(DF_ARENA_DIR),
+            local_files_only=True,
+            low_cpu_mem_usage=True,
         )
-        self.heads = nn.Linear(64, 4)
+    finally:
+        os.chdir(previous_directory)
+    model = model.to(device).eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
 
-    def forward(self, features):
-        embedding = self.encoder(features).flatten(1)
-        return self.heads(embedding)
+
+@torch.no_grad()
+def extract_embedding(backbone, audio, device):
+    segment = torch.from_numpy(audio).to(device)
+    ssl_features = backbone._ssl_features(segment)
+    cls_embedding, _frames, _attn = backbone.conformer.forward_tokens(ssl_features)
+    return cls_embedding.squeeze(0).float().cpu()
+
+
+def embeddings_for_rows(rows, backbone, device, cache_dir: Path):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    embeddings = []
+    for row in tqdm(rows, desc="DF-Arena embed"):
+        audio_path = Path(row["path"])
+        cache_path = cache_dir / cache_key(audio_path)
+        if cache_path.is_file():
+            embeddings.append(torch.load(cache_path, map_location="cpu", weights_only=True))
+            continue
+        audio = load_audio(audio_path)
+        vector = extract_embedding(backbone, audio, device)
+        torch.save(vector, cache_path)
+        embeddings.append(vector)
+    return torch.stack(embeddings)
 
 
 def fuse_file_fake(vp, mp, vf, mf):
@@ -178,21 +203,23 @@ def evaluate(model, loader, loss_fn, device):
     return total / max(count, 1), correct / max(count, 1)
 
 
-def save_checkpoint(path: Path, model, args):
+def save_checkpoint(path: Path, model):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "state_dict": model.state_dict(),
             "label_columns": LABEL_COLUMNS,
+            "embed_dim": EMBED_DIM,
+            "backbone": "df_arena_1b",
         },
         path,
     )
     print(f"saved {path}")
 
 
-def load_model(ckpt: Path, device):
+def load_heads(ckpt: Path, device):
     payload = torch.load(ckpt, map_location=device, weights_only=False)
-    model = TaskHeads().to(device)
+    model = TaskHeads(payload.get("embed_dim", EMBED_DIM)).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
     return model
@@ -204,12 +231,19 @@ def collate_train(batch):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train or predict 4 task heads.")
+    parser = argparse.ArgumentParser(
+        description="Fine-tune 4 task heads on frozen DF-Arena 1B embeddings."
+    )
     parser.add_argument("--train-csv", type=Path)
     parser.add_argument("--valid-csv", type=Path)
-    parser.add_argument("--ckpt", type=Path, default=Path("model") / "task_heads.pt")
+    parser.add_argument("--ckpt", type=Path, default=MODEL_DIR / "task_heads.pt")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=BASE_DIR / "data" / "cache" / "df_arena_emb",
+    )
     parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--max-per-source", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -235,20 +269,31 @@ def train(args, device):
     if not args.train_csv or not args.valid_csv:
         raise ValueError("학습에는 --train-csv 와 --valid-csv 가 필요합니다")
     cap = args.max_per_source or None
-    train_set = LogmelDataset(read_csv_rows(args.train_csv), cap)
-    valid_set = LogmelDataset(read_csv_rows(args.valid_csv), cap)
-    if len(train_set) == 0:
+    train_rows = read_csv_rows(args.train_csv)
+    valid_rows = read_csv_rows(args.valid_csv)
+    if cap:
+        train_rows = _cap_per_source(train_rows, cap)
+        valid_rows = _cap_per_source(valid_rows, cap)
+    if not train_rows:
         raise SystemExit("train.csv에 오디오가 없습니다")
 
+    backbone = load_df_arena(device)
+    print("DF-Arena 1B frozen. extracting embeddings...")
+    train_emb = embeddings_for_rows(train_rows, backbone.backbone, device, args.cache_dir)
+    valid_emb = embeddings_for_rows(valid_rows, backbone.backbone, device, args.cache_dir)
+    del backbone
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     train_loader = DataLoader(
-        train_set,
+        EmbeddingDataset(train_rows, train_emb),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_train,
     )
     valid_loader = DataLoader(
-        valid_set,
+        EmbeddingDataset(valid_rows, valid_emb),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -269,7 +314,7 @@ def train(args, device):
         )
         if valid_acc >= best_acc:
             best_acc = valid_acc
-            save_checkpoint(args.ckpt, model, args)
+            save_checkpoint(args.ckpt, model)
 
 
 def find_audio_files(test_dir: Path):
@@ -285,18 +330,17 @@ def find_audio_files(test_dir: Path):
 
 
 def predict(args, device):
-    model = load_model(args.ckpt, device)
+    heads = load_heads(args.ckpt, device)
+    backbone = load_df_arena(device)
     column_names, submission_rows = _read_submission(args.sample_submission)
-    audio_files = {
-        path.stem: path for path in find_audio_files(args.test_dir)
-    }
+    audio_files = {path.stem: path for path in find_audio_files(args.test_dir)}
 
     for row in tqdm(submission_rows, desc="predict"):
         audio_id = str(row["ID"]).strip()
-        audio_path = audio_files[audio_id]
-        features = load_logmel(audio_path).unsqueeze(0).to(device)
+        audio = load_audio(audio_files[audio_id])
+        embedding = extract_embedding(backbone.backbone, audio, device).unsqueeze(0).to(device)
         with torch.inference_mode():
-            probs = torch.sigmoid(model(features))[0].cpu().tolist()
+            probs = torch.sigmoid(heads(embedding))[0].cpu().tolist()
         for column, value in zip(PROB_COLUMNS, probs):
             row[column] = round(float(value), 10)
         row["FILE_FAKE_PROB"] = round(
