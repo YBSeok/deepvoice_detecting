@@ -12,8 +12,8 @@
   Fake_Music_Only / 오버레이 -> 부분 fake 혼합 포함
   VF 헤드: 음성 있는 클립만 (Libri vs TTS_ko, 오버레이 포함)
 
-# 로컬 학습 (폴더당 400클립, Zeroth/Phone 1200, 전화 왜곡 30%)
-python train_v2.py --train-csv data/manifests/train.csv --valid-csv data/manifests/valid.csv --ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt --max-per-source 400 --voice-per-source 1200 --overlays 400 --phone-frac 0.3
+# 로컬 학습 (폴더당 400클립, Zeroth/Phone 1200, 전화·코덱·대역 증강)
+python train_v2.py --train-csv data/manifests/train.csv --valid-csv data/manifests/valid.csv --ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt --max-per-source 400 --voice-per-source 1200 --overlays 400 --phone-frac 0.3 --codec-frac 0.2 --band-frac 0.15
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ from heads.music_fake import EMBED_DIM, MusicFakeHead
 from learning_data import (
     AUDIO_SAMPLE_RATE,
     add_all_overlays,
+    add_band_rows,
+    add_codec_rows,
     add_phone_rows,
     cache_key,
     load_row_audio,
@@ -267,6 +269,18 @@ def parse_args():
         default=0.3,
         help="이미 전화인 Phone 폴더를 제외하고, 그 비율만큼 8 kHz 왕복 복사본을 넣는다.",
     )
+    parser.add_argument(
+        "--codec-frac",
+        type=float,
+        default=0.2,
+        help="12 kHz 왕복 + 8-bit 양자화 복사본 비율 (코덱 손상 근사).",
+    )
+    parser.add_argument(
+        "--band-frac",
+        type=float,
+        default=0.15,
+        help="4 kHz 대역제한 복사본 비율.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     return parser.parse_args()
@@ -289,6 +303,10 @@ def main():
     valid_rows.extend(add_all_overlays(valid_rows, max(args.overlays // 10, 0), args.seed + 1))
     train_rows.extend(add_phone_rows(train_rows, args.phone_frac, args.seed + 99))
     valid_rows.extend(add_phone_rows(valid_rows, args.phone_frac, args.seed + 100))
+    train_rows.extend(add_codec_rows(train_rows, args.codec_frac, args.seed + 199))
+    valid_rows.extend(add_codec_rows(valid_rows, args.codec_frac * 0.5, args.seed + 200))
+    train_rows.extend(add_band_rows(train_rows, args.band_frac, args.seed + 299))
+    valid_rows.extend(add_band_rows(valid_rows, args.band_frac * 0.5, args.seed + 300))
     if not train_rows:
         raise SystemExit("학습 클립이 없습니다. 매니페스트 규칙을 확인하세요.")
 

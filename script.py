@@ -44,6 +44,7 @@ DEFAULT_SAMPLE_SUBMISSION = Path("data") / "sample_submission.csv"
 DEFAULT_OUTPUT_PATH = Path("output") / "submission.csv"
 DEFAULT_MF_CKPT = MODEL_DIR / "mf_head.pt"
 DEFAULT_VF_CKPT = MODEL_DIR / "vf_head.pt"
+DEFAULT_DF_LORA = MODEL_DIR / "df_arena_lora.pt"
 
 # 오디오 처리 설정
 AUDIO_SAMPLE_RATE = 16_000
@@ -106,6 +107,12 @@ def parse_arguments():
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--mf-ckpt", type=Path, default=DEFAULT_MF_CKPT)
     parser.add_argument("--vf-ckpt", type=Path, default=DEFAULT_VF_CKPT)
+    parser.add_argument(
+        "--df-lora",
+        type=Path,
+        default=DEFAULT_DF_LORA,
+        help="Optional DF Conformer LoRA adapter from train_df_adapt.py. Missing file = frozen DF.",
+    )
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument(
         "--vf-device",
@@ -390,7 +397,7 @@ def pooled_spoof_probability(frames, weights, classifier, fake_label_index):
 # 5. Fake heads (VF, MF)
 # -----------------------------------------------------------------------------
 
-def load_df_arena_model(device):
+def load_df_arena_model(device, lora_path=None):
     if str(MODEL_DIR) not in sys.path:
         sys.path.insert(0, str(MODEL_DIR))
     from df_arena_1b.modeling_antispoofing import DF_Arena_1B_Antispoofing
@@ -405,6 +412,12 @@ def load_df_arena_model(device):
         )
     finally:
         os.chdir(previous_directory)
+
+    if lora_path is not None and Path(lora_path).is_file():
+        from df_lora import apply_saved_adapter
+
+        info = apply_saved_adapter(model, Path(lora_path), device=None)
+        print(f"Loaded DF LoRA adapter {lora_path}: {info}")
 
     model = model.to(device).eval()
     fake_label_index = int(model.config.label2id["spoof"])
@@ -519,15 +532,12 @@ def fuse_file_fake(head_outputs):
 def fuse_voice_fake(panns_vf, df_vf):
     """DF-Arena와 PANNs VF를 양방향 게이트로 합친다.
 
-    DF-Arena 가중치는 고정이므로 재학습 대신 사용 방식만 바꾼다.
+    DF는 기본 고정이며, model/df_arena_lora.pt 가 있으면 Conformer LoRA만 얹는다.
 
     - max(panns, df): 실음성/전화/실믹스 오탐의 합집합 (ADS↓)
-    - df + (panns-df)*df (이전): PANNs가 DF를 올릴 수만 있고, DF 오탐은 못 깎음
     - 양방향: 높은 쪽은 낮은 쪽을 게이트로만 가산
         panns >= df → df + (panns-df)*df
         df > panns  → panns + (df-panns)*panns
-
-    전화·실믹스처럼 학습 헤드(PANNs)는 낮은데 DF만 높은 경우 VF가 내려간다.
     """
     panns_vf = float(panns_vf)
     df_vf = float(df_vf)
@@ -554,11 +564,12 @@ class FourHeadPredictor:
     VF = bidirectional gate(PANNs VF, DF-Arena)
     """
 
-    def __init__(self, device, mf_ckpt, vf_ckpt, vf_device=None):
+    def __init__(self, device, mf_ckpt, vf_ckpt, vf_device=None, df_lora=None):
         self.device = device
         self.mf_ckpt = mf_ckpt
         self.vf_ckpt = vf_ckpt
         self.vf_device = device if vf_device is None else vf_device
+        self.df_lora = df_lora
 
     def run_presence_heads(self, audio_files):
         model, voice_indices, music_indices = load_panns_model(self.device)
@@ -602,7 +613,9 @@ class FourHeadPredictor:
         return stems
 
     def _run_voice_fake(self, audio_files, stems):
-        df_arena_model, fake_label_index = load_df_arena_model(self.vf_device)
+        df_arena_model, fake_label_index = load_df_arena_model(
+            self.vf_device, lora_path=self.df_lora
+        )
         scores = {}
         for audio_path in tqdm(audio_files, desc="Head VF"):
             try:
@@ -705,7 +718,9 @@ def main():
     # 2. VP/MP는 믹스, MF는 PANNs 헤드, VF는 DF-Arena 기본 + 동의할 때만 PANNs 가산.
     vf_name = args.device if args.vf_device == "auto" else args.vf_device
     vf_device = torch.device("cpu") if vf_name == "cpu" else select_device(vf_name)
-    predictor = FourHeadPredictor(device, args.mf_ckpt, args.vf_ckpt, vf_device)
+    predictor = FourHeadPredictor(
+        device, args.mf_ckpt, args.vf_ckpt, vf_device, df_lora=args.df_lora
+    )
     submission_rows = predictor.predict(audio_files, submission_rows)
 
     # 3. 5개 예측값을 제출 파일로 저장한다.

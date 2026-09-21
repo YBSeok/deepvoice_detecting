@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""매니페스트 → 오버레이/전화 채널 학습 행.
+"""매니페스트 → 오버레이/전화·코덱·대역제한 학습 행.
 
-train_v2(PANNs MF)와 embed_df_arena(VF 1280 추출)가 같은 행 구성을 쓴다.
+train_v2(PANNs MF)와 train_df_adapt(DF LoRA)가 같은 행 구성을 쓴다.
+Whispeak식 강한 아키텍처 복제 대신, 평가 분포(전화·압축·대역)에 맞춘 aug만 이식한다.
 """
 
 from __future__ import annotations
@@ -17,6 +18,9 @@ import numpy as np
 AUDIO_SAMPLE_RATE = 16_000
 SEGMENT_SAMPLES = 64_600
 PHONE_SAMPLE_RATE = 8_000
+BAND_LIMIT_HZ = 4_000
+CODEC_SAMPLE_RATE = 12_000
+AUG_PREFIXES = ("phone::", "codec::", "band::")
 
 REAL_RULES = {"Music_Only", "Voice_and_Music", "Voice_Only", "Fake_Voice_Only"}
 FAKE_RULES = {"Fake_Music_Only"}
@@ -41,8 +45,9 @@ def parse_rewrites(items):
 def rewrite_path(path_text, rewrites):
     if not rewrites or not path_text:
         return path_text
-    if str(path_text).startswith("phone::"):
-        return "phone::" + rewrite_path(path_text[len("phone::") :], rewrites)
+    for prefix in AUG_PREFIXES:
+        if str(path_text).startswith(prefix):
+            return prefix + rewrite_path(path_text[len(prefix) :], rewrites)
     if str(path_text).startswith("overlay::"):
         return path_text
     text = str(path_text).replace("\\", "/")
@@ -133,6 +138,45 @@ def telephone_channel(audio, sr=AUDIO_SAMPLE_RATE, seed=0):
         band = band[: audio.size]
     noise = rng.normal(0.0, 0.003, size=band.size).astype(np.float32)
     return peak_norm(band + noise, 0.7).astype(np.float32)
+
+
+def band_limit_channel(audio, sr=AUDIO_SAMPLE_RATE, cutoff_hz=BAND_LIMIT_HZ, seed=0):
+    """저역 통과(대역 제한). 전화·저품질 업로드에서 고주파 아티팩트가 사라지는 경우를 흉내낸다."""
+    rng = np.random.default_rng(int(seed) % (2**32))
+    target_sr = max(int(cutoff_hz * 2), 2_000)
+    narrow = librosa.resample(audio, orig_sr=sr, target_sr=target_sr, res_type="soxr_hq")
+    band = librosa.resample(narrow, orig_sr=target_sr, target_sr=sr, res_type="soxr_hq")
+    if band.size < audio.size:
+        band = np.pad(band, (0, audio.size - band.size))
+    else:
+        band = band[: audio.size]
+    noise = rng.normal(0.0, 0.0015, size=band.size).astype(np.float32)
+    return peak_norm(band + noise, 0.75).astype(np.float32)
+
+
+def codec_channel(audio, sr=AUDIO_SAMPLE_RATE, seed=0):
+    """경량 코덱 손상: 12 kHz 왕복 + 8-bit 양자화.
+
+    ffmpeg 의존 없이 mp3/opus 압축의 대역·양자화 손실을 근사한다.
+    """
+    rng = np.random.default_rng(int(seed) % (2**32))
+    narrow = librosa.resample(
+        audio, orig_sr=sr, target_sr=CODEC_SAMPLE_RATE, res_type="soxr_hq"
+    )
+    peak = float(np.max(np.abs(narrow))) + 1e-6
+    quantized = np.round(narrow / peak * 127.0) / 127.0 * peak
+    restored = librosa.resample(
+        quantized.astype(np.float32),
+        orig_sr=CODEC_SAMPLE_RATE,
+        target_sr=sr,
+        res_type="soxr_hq",
+    )
+    if restored.size < audio.size:
+        restored = np.pad(restored, (0, audio.size - restored.size))
+    else:
+        restored = restored[: audio.size]
+    noise = rng.normal(0.0, 0.002, size=restored.size).astype(np.float32)
+    return peak_norm(restored + noise, 0.75).astype(np.float32)
 
 
 def make_overlay_rows(
@@ -293,7 +337,8 @@ def add_all_overlays(rows, count, seed):
     return extras
 
 
-def add_phone_rows(rows, frac, seed):
+def add_channel_aug_rows(rows, frac, seed, prefix, suffix):
+    """기존 행의 일부를 prefix 복사본으로 추가한다 (라벨 유지)."""
     if frac <= 0 or not rows:
         return []
     rng = np.random.default_rng(seed)
@@ -305,7 +350,7 @@ def add_phone_rows(rows, frac, seed):
         i
         for i, row in enumerate(rows)
         if "Phone" not in str(row.get("source_folder", ""))
-        and not str(row.get("path", "")).startswith("phone::")
+        and not any(str(row.get("path", "")).startswith(p) for p in AUG_PREFIXES)
     ]
     if not eligible:
         return []
@@ -314,10 +359,22 @@ def add_phone_rows(rows, frac, seed):
     extras = []
     for index in chosen:
         row = dict(rows[int(index)])
-        row["path"] = "phone::" + str(row["path"])
-        row["source_folder"] = str(row.get("source_folder", "")) + "_phone"
+        row["path"] = prefix + str(row["path"])
+        row["source_folder"] = str(row.get("source_folder", "")) + suffix
         extras.append(row)
     return extras
+
+
+def add_phone_rows(rows, frac, seed):
+    return add_channel_aug_rows(rows, frac, seed, "phone::", "_phone")
+
+
+def add_codec_rows(rows, frac, seed):
+    return add_channel_aug_rows(rows, frac, seed, "codec::", "_codec")
+
+
+def add_band_rows(rows, frac, seed):
+    return add_channel_aug_rows(rows, frac, seed, "band::", "_band")
 
 
 def row_has_voice(row):
@@ -326,15 +383,23 @@ def row_has_voice(row):
     return str(row.get("rule", "")).startswith("overlay")
 
 
+def strip_aug_prefix(path_text):
+    text = str(path_text)
+    for prefix in AUG_PREFIXES:
+        if text.startswith(prefix):
+            return prefix.rstrip(":"), text[len(prefix) :]
+    return None, text
+
+
 def is_phone_row(row):
-    return str(row.get("path", "")).startswith("phone::")
+    kind, _ = strip_aug_prefix(row.get("path", ""))
+    return kind == "phone" or str(row.get("path", "")).startswith("phone::")
 
 
 def load_row_audio(row):
-    phone = is_phone_row(row)
+    kind, bare_path = strip_aug_prefix(row.get("path", ""))
     work = dict(row)
-    if phone:
-        work["path"] = work["path"][len("phone::") :]
+    work["path"] = bare_path
     if str(work.get("rule", "")).startswith("overlay"):
         audio = overlay_audio(
             load_audio(work["voice_path"]),
@@ -344,9 +409,14 @@ def load_row_audio(row):
         )
     else:
         audio = load_audio(work["path"])
-    if phone:
+    if kind is not None:
         seed = int(hashlib.md5(str(row["path"]).encode("utf-8")).hexdigest()[:8], 16)
-        audio = telephone_channel(audio, seed=seed)
+        if kind == "phone":
+            audio = telephone_channel(audio, seed=seed)
+        elif kind == "codec":
+            audio = codec_channel(audio, seed=seed)
+        elif kind == "band":
+            audio = band_limit_channel(audio, seed=seed)
     return audio
 
 
@@ -357,6 +427,22 @@ def cache_key(row):
     return f"{name}_{digest}.pt"
 
 
+def is_domain_focus_row(row):
+    """DF 도메인 적응에서 비중을 올릴 행 (phone·한국어·실믹스·TTS)."""
+    source = str(row.get("source_folder", "")).lower()
+    rule = str(row.get("rule", ""))
+    path = str(row.get("path", ""))
+    if any(path.startswith(p) for p in AUG_PREFIXES):
+        return True
+    if any(token in source for token in ("phone", "zeroth", "tts", "mix")):
+        return True
+    if rule == "Voice_and_Music" or rule.startswith("overlay"):
+        return True
+    if rule == "Fake_Voice_Only":
+        return True
+    return False
+
+
 def build_split_rows(
     csv_path,
     max_per_source=None,
@@ -364,10 +450,14 @@ def build_split_rows(
     overlays=0,
     overlay_seed=42,
     phone_frac=0.0,
+    codec_frac=0.0,
+    band_frac=0.0,
     rewrites=None,
 ):
     rows = [rewrite_row(row, rewrites) for row in read_csv_rows(csv_path)]
     rows = music_rows(rows, max_per_source, voice_per_source)
     rows.extend(add_all_overlays(rows, overlays, overlay_seed))
     rows.extend(add_phone_rows(rows, phone_frac, overlay_seed + 99))
+    rows.extend(add_codec_rows(rows, codec_frac, overlay_seed + 199))
+    rows.extend(add_band_rows(rows, band_frac, overlay_seed + 299))
     return rows
