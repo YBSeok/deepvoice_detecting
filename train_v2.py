@@ -13,7 +13,7 @@
   VF 헤드: 음성 있는 클립만 (Libri vs TTS_ko, 오버레이 포함)
 
 # 로컬 학습 (폴더당 400클립, Zeroth/Phone 1200, 전화·코덱·대역 증강)
-python train_v2.py --train-csv data/manifests/train.csv --valid-csv data/manifests/valid.csv --ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt --max-per-source 400 --voice-per-source 1200 --overlays 400 --phone-frac 0.3 --codec-frac 0.2 --band-frac 0.15
+python train_v2.py --train-csv data/manifests/train.csv --valid-csv data/manifests/valid.csv --ckpt model/mf_head.pt --vf-ckpt model/vf_head.pt --max-per-source 400 --voice-per-source 1200 --overlays 500 --phone-frac 0.12 --codec-frac 0.08 --band-frac 0 --gain-frac 0.1 --noise-frac 0.1
 """
 
 from __future__ import annotations
@@ -36,11 +36,15 @@ from learning_data import (
     add_all_overlays,
     add_band_rows,
     add_codec_rows,
+    add_gain_rows,
+    add_noise_rows,
     add_phone_rows,
     cache_key,
     load_row_audio,
     music_rows,
+    parse_rewrites,
     read_csv_rows,
+    rewrite_row,
 )
 
 
@@ -262,27 +266,51 @@ def parse_args():
         default=1200,
         help="Zeroth·Phone 한국어 실음성 캡. TTS/전화 오탐을 줄이려고 영어 Libri보다 많이 넣는다.",
     )
-    parser.add_argument("--overlays", type=int, default=400)
+    parser.add_argument("--overlays", type=int, default=500)
     parser.add_argument(
         "--phone-frac",
         type=float,
-        default=0.3,
+        default=0.12,
         help="이미 전화인 Phone 폴더를 제외하고, 그 비율만큼 8 kHz 왕복 복사본을 넣는다.",
     )
     parser.add_argument(
         "--codec-frac",
         type=float,
-        default=0.2,
+        default=0.08,
         help="12 kHz 왕복 + 8-bit 양자화 복사본 비율 (코덱 손상 근사).",
     )
     parser.add_argument(
         "--band-frac",
         type=float,
-        default=0.15,
+        default=0.0,
         help="4 kHz 대역제한 복사본 비율.",
+    )
+    parser.add_argument(
+        "--gain-frac",
+        type=float,
+        default=0.1,
+        help="Whispeak-like gain (cue-preserving).",
+    )
+    parser.add_argument(
+        "--noise-frac",
+        type=float,
+        default=0.1,
+        help="Light additive noise SNR ~18-30 dB.",
+    )
+    parser.add_argument(
+        "--channel-fake-share",
+        type=float,
+        default=0.25,
+        help="Share of channel-aug copies taken from fake rows (rest=bonafide).",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument(
+        "--rewrite-prefix",
+        action="append",
+        default=[],
+        help="경로 치환 SRC=DST (Docker 마운트용)",
+    )
     return parser.parse_args()
 
 
@@ -295,18 +323,30 @@ def select_device(name):
 def main():
     args = parse_args()
     device = select_device(args.device)
+    rewrites = parse_rewrites(args.rewrite_prefix)
     cap = args.max_per_source or None
     voice_cap = args.voice_per_source or None
-    train_rows = music_rows(read_csv_rows(args.train_csv), cap, voice_cap)
-    valid_rows = music_rows(read_csv_rows(args.valid_csv), cap, voice_cap)
+    train_rows = [
+        rewrite_row(row, rewrites)
+        for row in music_rows(read_csv_rows(args.train_csv), cap, voice_cap)
+    ]
+    valid_rows = [
+        rewrite_row(row, rewrites)
+        for row in music_rows(read_csv_rows(args.valid_csv), cap, voice_cap)
+    ]
     train_rows.extend(add_all_overlays(train_rows, args.overlays, args.seed))
     valid_rows.extend(add_all_overlays(valid_rows, max(args.overlays // 10, 0), args.seed + 1))
-    train_rows.extend(add_phone_rows(train_rows, args.phone_frac, args.seed + 99))
-    valid_rows.extend(add_phone_rows(valid_rows, args.phone_frac, args.seed + 100))
-    train_rows.extend(add_codec_rows(train_rows, args.codec_frac, args.seed + 199))
-    valid_rows.extend(add_codec_rows(valid_rows, args.codec_frac * 0.5, args.seed + 200))
-    train_rows.extend(add_band_rows(train_rows, args.band_frac, args.seed + 299))
-    valid_rows.extend(add_band_rows(valid_rows, args.band_frac * 0.5, args.seed + 300))
+    share = getattr(args, "channel_fake_share", 0.25)
+    train_rows.extend(add_phone_rows(train_rows, args.phone_frac, args.seed + 99, fake_share=share))
+    valid_rows.extend(add_phone_rows(valid_rows, args.phone_frac, args.seed + 100, fake_share=share))
+    train_rows.extend(add_codec_rows(train_rows, args.codec_frac, args.seed + 199, fake_share=share))
+    valid_rows.extend(add_codec_rows(valid_rows, args.codec_frac * 0.5, args.seed + 200, fake_share=share))
+    train_rows.extend(add_band_rows(train_rows, args.band_frac, args.seed + 299, fake_share=min(share, 0.15)))
+    valid_rows.extend(add_band_rows(valid_rows, args.band_frac * 0.5, args.seed + 300, fake_share=min(share, 0.15)))
+    train_rows.extend(add_gain_rows(train_rows, args.gain_frac, args.seed + 399, fake_share=0.5))
+    valid_rows.extend(add_gain_rows(valid_rows, args.gain_frac * 0.5, args.seed + 400, fake_share=0.5))
+    train_rows.extend(add_noise_rows(train_rows, args.noise_frac, args.seed + 499, fake_share=0.35))
+    valid_rows.extend(add_noise_rows(valid_rows, args.noise_frac * 0.5, args.seed + 500, fake_share=0.35))
     if not train_rows:
         raise SystemExit("학습 클립이 없습니다. 매니페스트 규칙을 확인하세요.")
 

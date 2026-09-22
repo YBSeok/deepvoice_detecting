@@ -2,16 +2,18 @@
 """DF-Arena 가벼운 도메인 적응 (Colab A100 권장).
 
 SSL(XLS-R 1B)은 고정하고 Conformer 마지막 블록만 LoRA(또는 full)로 학습한다.
-학습 분포는 phone / codec / band aug + 한국어·실믹스·TTS 비중을 올린다.
+학습 분포는 약한 phone/codec + gain/noise + 오버레이(음성×음악) + 한국어·실믹스·TTS 비중.
+(강한 band 제한·고비율 채널 복제는 ADS를 깎아 기본 OFF)
+
 
 예:
   python train_df_adapt.py \\
     --train-csv data/manifests/train.csv \\
     --valid-csv data/manifests/valid.csv \\
     --out model/df_arena_lora.pt \\
-    --max-per-source 200 --voice-per-source 800 --overlays 200 \\
-    --phone-frac 0.35 --codec-frac 0.25 --band-frac 0.2 \\
-    --domain-repeat 2 --epochs 3 --batch-size 2 --mode lora
+    --max-per-source 200 --voice-per-source 800 --overlays 300 \\
+    --phone-frac 0.12 --codec-frac 0.08 --band-frac 0 --gain-frac 0.1 --noise-frac 0.1 \\
+    --domain-repeat 1 --epochs 3 --batch-size 2 --mode lora
 """
 
 from __future__ import annotations
@@ -151,16 +153,19 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max-per-source", type=int, default=200)
     parser.add_argument("--voice-per-source", type=int, default=800)
-    parser.add_argument("--overlays", type=int, default=200)
-    parser.add_argument("--phone-frac", type=float, default=0.35)
-    parser.add_argument("--codec-frac", type=float, default=0.25)
-    parser.add_argument("--band-frac", type=float, default=0.2)
+    parser.add_argument("--overlays", type=int, default=300)
+    parser.add_argument("--phone-frac", type=float, default=0.12)
+    parser.add_argument("--codec-frac", type=float, default=0.08)
+    parser.add_argument("--band-frac", type=float, default=0.0)
     parser.add_argument(
         "--domain-repeat",
         type=int,
-        default=2,
+        default=1,
         help="phone/Zeroth/TTS/실믹스 행 샘플링 가중치 배수",
     )
+    parser.add_argument("--gain-frac", type=float, default=0.1)
+    parser.add_argument("--noise-frac", type=float, default=0.1)
+    parser.add_argument("--channel-fake-share", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument(
@@ -192,6 +197,9 @@ def main():
         phone_frac=args.phone_frac,
         codec_frac=args.codec_frac,
         band_frac=args.band_frac,
+        gain_frac=args.gain_frac,
+        noise_frac=args.noise_frac,
+        channel_fake_share=args.channel_fake_share,
         rewrites=rewrites,
     )
     valid_rows = build_split_rows(
@@ -203,6 +211,9 @@ def main():
         phone_frac=args.phone_frac,
         codec_frac=args.codec_frac * 0.5,
         band_frac=args.band_frac * 0.5,
+        gain_frac=args.gain_frac * 0.5,
+        noise_frac=args.noise_frac * 0.5,
+        channel_fake_share=args.channel_fake_share,
         rewrites=rewrites,
     )
 

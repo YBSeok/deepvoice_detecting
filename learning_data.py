@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
-"""매니페스트 → 오버레이/전화·코덱·대역제한 학습 행.
+"""매니페스트 → 오버레이 + 채널/전송 aug 학습 행.
 
-train_v2(PANNs MF)와 train_df_adapt(DF LoRA)가 같은 행 구성을 쓴다.
-Whispeak식 강한 아키텍처 복제 대신, 평가 분포(전화·압축·대역)에 맞춘 aug만 이식한다.
+train_v2(PANNs) · train_df_adapt(DF LoRA) · train_fusion 이 같은 구성을 쓴다.
+
+## Whispeak(ASVspoof5) vs 이 대회
+
+Whispeak 채널 aug (논문): silence / time-stretch / pitch / MUSAN noise / RIR /
+RawBoost / 16k·8k codec / bit-crush / gain / SpecAug — **온라인 직렬**, 각
+변환 확률 p_DA≈0.05~0.2. 목적은 **음성 단일 트랙** 전송 강건성.
+
+이 대회 요구: 음성·음악 **단독/공존**, PRESENT + FAKE 4축.
+→ Whispeak에 없는 **오버레이(음성×음악 조합)** 가 핵심.
+→ 전화·코덱은 CPS용으로 **약하게·실음성 위주**만.
+→ 4 kHz band·고비율 오프라인 복제·fake에 동일 채널 삭감은 ADS를 깎음
+  (spoof 고주파 단서 제거 = “깨끗한 생성 음성”과 반대 방향).
 """
 
 from __future__ import annotations
@@ -18,13 +29,18 @@ import numpy as np
 AUDIO_SAMPLE_RATE = 16_000
 SEGMENT_SAMPLES = 64_600
 PHONE_SAMPLE_RATE = 8_000
-BAND_LIMIT_HZ = 4_000
-CODEC_SAMPLE_RATE = 12_000
-AUG_PREFIXES = ("phone::", "codec::", "band::")
+# band는 기본 OFF. 켤 때도 4 kHz(너무 셈) 대신 6 kHz.
+BAND_LIMIT_HZ = 6_000
+# Whispeak 16k codec에 가깝게: 예전 12 kHz+8bit → 14 kHz+10bit
+CODEC_SAMPLE_RATE = 14_000
+CODEC_BITS = 10
+AUG_PREFIXES = ("phone::", "codec::", "band::", "gain::", "noise::")
 
 REAL_RULES = {"Music_Only", "Voice_and_Music", "Voice_Only", "Fake_Voice_Only"}
 FAKE_RULES = {"Fake_Music_Only"}
-TRAIN_RULES = REAL_RULES | FAKE_RULES
+# 진짜 반주 + 가짜 보컬 믹스 (Drive: Music_FakeVocal_Mix)
+MIX_FAKE_VOICE_RULES = {"Music_FakeVocal"}
+TRAIN_RULES = REAL_RULES | FAKE_RULES | MIX_FAKE_VOICE_RULES
 
 
 def read_csv_rows(path: Path):
@@ -76,9 +92,13 @@ def folder_contains(row, needle):
 def row_limit(row, max_per_source, voice_per_source, mix_per_source=None):
     source = row.get("source_folder", "")
     rule = row.get("rule", "")
-    if voice_per_source and ("Zeroth" in source or "Phone" in source):
+    source_l = str(source).lower()
+    # Zeroth·전화·AI Hub 콜 — 한국어/채널 도메인 비중
+    if voice_per_source and any(
+        token in source_l for token in ("zeroth", "phone", "call", "aihub")
+    ):
         return voice_per_source
-    if mix_per_source and rule == "Voice_and_Music":
+    if mix_per_source and rule in {"Voice_and_Music", "Music_FakeVocal"}:
         return mix_per_source
     return max_per_source
 
@@ -99,7 +119,14 @@ def music_rows(rows, max_per_source=None, voice_per_source=None, mix_per_source=
 
 
 def load_audio(path):
-    audio, _ = librosa.load(str(path), sr=AUDIO_SAMPLE_RATE, mono=True, dtype=np.float32)
+    """읽기 실패·0바이트·깨진 파일은 무음으로 대체 (학습이 죽지 않게)."""
+    try:
+        path = Path(path)
+        if not path.is_file() or path.stat().st_size == 0:
+            return np.zeros(SEGMENT_SAMPLES, dtype=np.float32)
+        audio, _ = librosa.load(str(path), sr=AUDIO_SAMPLE_RATE, mono=True, dtype=np.float32)
+    except Exception:
+        return np.zeros(SEGMENT_SAMPLES, dtype=np.float32)
     if audio.size == 0 or not np.isfinite(audio).all():
         return np.zeros(SEGMENT_SAMPLES, dtype=np.float32)
     if audio.size < SEGMENT_SAMPLES:
@@ -155,16 +182,17 @@ def band_limit_channel(audio, sr=AUDIO_SAMPLE_RATE, cutoff_hz=BAND_LIMIT_HZ, see
 
 
 def codec_channel(audio, sr=AUDIO_SAMPLE_RATE, seed=0):
-    """경량 코덱 손상: 12 kHz 왕복 + 8-bit 양자화.
+    """경량 코덱 손상: 14 kHz 왕복 + 10-bit 양자화 (Whispeak codec/bit-crush 약화 이식).
 
-    ffmpeg 의존 없이 mp3/opus 압축의 대역·양자화 손실을 근사한다.
+    예전 12 kHz+8bit는 spoof 단서를 과하게 지워 ADS↓ 유발.
     """
     rng = np.random.default_rng(int(seed) % (2**32))
+    levels = float(2 ** (CODEC_BITS - 1) - 1)
     narrow = librosa.resample(
         audio, orig_sr=sr, target_sr=CODEC_SAMPLE_RATE, res_type="soxr_hq"
     )
     peak = float(np.max(np.abs(narrow))) + 1e-6
-    quantized = np.round(narrow / peak * 127.0) / 127.0 * peak
+    quantized = np.round(narrow / peak * levels) / levels * peak
     restored = librosa.resample(
         quantized.astype(np.float32),
         orig_sr=CODEC_SAMPLE_RATE,
@@ -175,8 +203,27 @@ def codec_channel(audio, sr=AUDIO_SAMPLE_RATE, seed=0):
         restored = np.pad(restored, (0, audio.size - restored.size))
     else:
         restored = restored[: audio.size]
-    noise = rng.normal(0.0, 0.002, size=restored.size).astype(np.float32)
+    noise = rng.normal(0.0, 0.0015, size=restored.size).astype(np.float32)
     return peak_norm(restored + noise, 0.75).astype(np.float32)
+
+
+def gain_channel(audio, sr=AUDIO_SAMPLE_RATE, seed=0):
+    """Whispeak Gain(0.25~2.0)의 온화판. 스펙트럼 단서는 거의 유지."""
+    del sr  # API 통일
+    rng = np.random.default_rng(int(seed) % (2**32))
+    gain = float(rng.uniform(0.5, 1.6))
+    return peak_norm(audio.astype(np.float32) * gain, 0.95).astype(np.float32)
+
+
+def noise_channel(audio, sr=AUDIO_SAMPLE_RATE, seed=0):
+    """Whispeak MUSAN noise의 대용: SNR 18~30 dB 백색 잡음 (외부 코퍼스 불필요)."""
+    del sr
+    rng = np.random.default_rng(int(seed) % (2**32))
+    snr_db = float(rng.uniform(18.0, 30.0))
+    power = float(np.mean(audio.astype(np.float64) ** 2) + 1e-9)
+    noise_power = power / (10.0 ** (snr_db / 10.0))
+    noise = rng.normal(0.0, np.sqrt(noise_power), size=audio.size).astype(np.float32)
+    return peak_norm(audio.astype(np.float32) + noise, 0.9).astype(np.float32)
 
 
 def make_overlay_rows(
@@ -337,8 +384,24 @@ def add_all_overlays(rows, count, seed):
     return extras
 
 
-def add_channel_aug_rows(rows, frac, seed, prefix, suffix):
-    """기존 행의 일부를 prefix 복사본으로 추가한다 (라벨 유지)."""
+def is_bonafide_content(row):
+    """생성·변조가 없는 클립 (채널 삭감을 주로 여기 적용 → CPS, ADS 보호)."""
+    return int(row.get("VOICE_FAKE", 0)) == 0 and int(row.get("MUSIC_FAKE", 0)) == 0
+
+
+def add_channel_aug_rows(
+    rows,
+    frac,
+    seed,
+    prefix,
+    suffix,
+    fake_share=0.25,
+):
+    """채널 복사본 추가.
+
+    Whispeak는 온라인 p_DA로 약하게 섞음. 우리는 오프라인 복제라 비율을 낮추고,
+    fake_share로 **실(bonafide) 위주**에만 채널 삭감을 걸어 spoof 단서 파괴를 막는다.
+    """
     if frac <= 0 or not rows:
         return []
     rng = np.random.default_rng(seed)
@@ -354,8 +417,22 @@ def add_channel_aug_rows(rows, frac, seed, prefix, suffix):
     ]
     if not eligible:
         return []
-    n = min(n, len(eligible))
-    chosen = rng.choice(eligible, size=n, replace=False)
+    bona = [i for i in eligible if is_bonafide_content(rows[i])]
+    fake = [i for i in eligible if not is_bonafide_content(rows[i])]
+    n_fake = min(int(round(n * float(fake_share))), len(fake), n)
+    n_bona = min(n - n_fake, len(bona))
+    # 풀이 부족하면 반대쪽·전체에서 보충
+    chosen = []
+    if n_bona > 0:
+        chosen.extend(rng.choice(bona, size=n_bona, replace=False).tolist())
+    if n_fake > 0:
+        chosen.extend(rng.choice(fake, size=n_fake, replace=False).tolist())
+    remain = n - len(chosen)
+    if remain > 0:
+        leftover = [i for i in eligible if i not in set(chosen)]
+        if leftover:
+            take = min(remain, len(leftover))
+            chosen.extend(rng.choice(leftover, size=take, replace=False).tolist())
     extras = []
     for index in chosen:
         row = dict(rows[int(index)])
@@ -365,16 +442,26 @@ def add_channel_aug_rows(rows, frac, seed, prefix, suffix):
     return extras
 
 
-def add_phone_rows(rows, frac, seed):
-    return add_channel_aug_rows(rows, frac, seed, "phone::", "_phone")
+def add_phone_rows(rows, frac, seed, fake_share=0.25):
+    return add_channel_aug_rows(rows, frac, seed, "phone::", "_phone", fake_share=fake_share)
 
 
-def add_codec_rows(rows, frac, seed):
-    return add_channel_aug_rows(rows, frac, seed, "codec::", "_codec")
+def add_codec_rows(rows, frac, seed, fake_share=0.25):
+    return add_channel_aug_rows(rows, frac, seed, "codec::", "_codec", fake_share=fake_share)
 
 
-def add_band_rows(rows, frac, seed):
-    return add_channel_aug_rows(rows, frac, seed, "band::", "_band")
+def add_band_rows(rows, frac, seed, fake_share=0.15):
+    # band는 spoof 고주파를 가장 많이 지움 → fake_share 더 낮게
+    return add_channel_aug_rows(rows, frac, seed, "band::", "_band", fake_share=fake_share)
+
+
+def add_gain_rows(rows, frac, seed, fake_share=0.5):
+    """Whispeak gain: 단서 보존형 → fake에도 상대적으로 더 허용."""
+    return add_channel_aug_rows(rows, frac, seed, "gain::", "_gain", fake_share=fake_share)
+
+
+def add_noise_rows(rows, frac, seed, fake_share=0.35):
+    return add_channel_aug_rows(rows, frac, seed, "noise::", "_noise", fake_share=fake_share)
 
 
 def row_has_voice(row):
@@ -417,6 +504,10 @@ def load_row_audio(row):
             audio = codec_channel(audio, seed=seed)
         elif kind == "band":
             audio = band_limit_channel(audio, seed=seed)
+        elif kind == "gain":
+            audio = gain_channel(audio, seed=seed)
+        elif kind == "noise":
+            audio = noise_channel(audio, seed=seed)
     return audio
 
 
@@ -428,17 +519,21 @@ def cache_key(row):
 
 
 def is_domain_focus_row(row):
-    """DF 도메인 적응에서 비중을 올릴 행 (phone·한국어·실믹스·TTS)."""
+    """DF 샘플 가중: 오버레이·한국어·실전화·TTS.
+
+    채널 aug 복사본 전체에 domain_repeat를 걸면(=예전) 삭감 분포가 2배로 증폭됨.
+    채널 접두사는 focus에서 제외한다.
+    """
     source = str(row.get("source_folder", "")).lower()
     rule = str(row.get("rule", ""))
     path = str(row.get("path", ""))
     if any(path.startswith(p) for p in AUG_PREFIXES):
-        return True
-    if any(token in source for token in ("phone", "zeroth", "tts", "mix")):
+        return False
+    if any(token in source for token in ("phone", "call", "zeroth", "tts", "mix")):
         return True
     if rule == "Voice_and_Music" or rule.startswith("overlay"):
         return True
-    if rule == "Fake_Voice_Only":
+    if rule in {"Fake_Voice_Only", "Music_FakeVocal"}:
         return True
     return False
 
@@ -452,12 +547,31 @@ def build_split_rows(
     phone_frac=0.0,
     codec_frac=0.0,
     band_frac=0.0,
+    gain_frac=0.0,
+    noise_frac=0.0,
+    channel_fake_share=0.25,
     rewrites=None,
 ):
     rows = [rewrite_row(row, rewrites) for row in read_csv_rows(csv_path)]
     rows = music_rows(rows, max_per_source, voice_per_source)
+    # 1) 대회 과제 핵심: 음성×음악 조합 (Whispeak에 없음)
     rows.extend(add_all_overlays(rows, overlays, overlay_seed))
-    rows.extend(add_phone_rows(rows, phone_frac, overlay_seed + 99))
-    rows.extend(add_codec_rows(rows, codec_frac, overlay_seed + 199))
-    rows.extend(add_band_rows(rows, band_frac, overlay_seed + 299))
+    # 2) 전송 강건성: 약·실음성 위주 (Whispeak online DA의 오프라인 근사)
+    rows.extend(
+        add_phone_rows(rows, phone_frac, overlay_seed + 99, fake_share=channel_fake_share)
+    )
+    rows.extend(
+        add_codec_rows(rows, codec_frac, overlay_seed + 199, fake_share=channel_fake_share)
+    )
+    rows.extend(
+        add_band_rows(
+            rows, band_frac, overlay_seed + 299, fake_share=min(channel_fake_share, 0.15)
+        )
+    )
+    rows.extend(
+        add_gain_rows(rows, gain_frac, overlay_seed + 399, fake_share=0.5)
+    )
+    rows.extend(
+        add_noise_rows(rows, noise_frac, overlay_seed + 499, fake_share=0.35)
+    )
     return rows

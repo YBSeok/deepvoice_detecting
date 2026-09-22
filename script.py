@@ -45,6 +45,7 @@ DEFAULT_OUTPUT_PATH = Path("output") / "submission.csv"
 DEFAULT_MF_CKPT = MODEL_DIR / "mf_head.pt"
 DEFAULT_VF_CKPT = MODEL_DIR / "vf_head.pt"
 DEFAULT_DF_LORA = MODEL_DIR / "df_arena_lora.pt"
+DEFAULT_VF_FUSION = MODEL_DIR / "vf_fusion.pt"
 
 # 오디오 처리 설정
 AUDIO_SAMPLE_RATE = 16_000
@@ -112,6 +113,18 @@ def parse_arguments():
         type=Path,
         default=DEFAULT_DF_LORA,
         help="Optional DF Conformer LoRA adapter from train_df_adapt.py. Missing file = frozen DF.",
+    )
+    parser.add_argument(
+        "--vf-fusion",
+        type=Path,
+        default=DEFAULT_VF_FUSION,
+        help="Optional learned VF fusion from train_fusion.py. Missing file = gate.",
+    )
+    parser.add_argument(
+        "--vf-gate",
+        choices=["bidir", "asym"],
+        default="bidir",
+        help="Gate when vf_fusion.pt is absent. asym = fake-boosted gate (ADS recovery).",
     )
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument(
@@ -194,11 +207,18 @@ def order_audio_files(audio_files, submission_rows):
 
 
 def load_audio(audio_path):
-    audio, _ = librosa.load(
-        audio_path, sr=AUDIO_SAMPLE_RATE, mono=True, dtype=np.float32
-    )
+    """읽기 실패·빈 파일은 짧은 무음으로 대체 (학습/평가가 한 파일에 죽지 않게)."""
+    try:
+        path = Path(audio_path)
+        if not path.is_file() or path.stat().st_size == 0:
+            return np.zeros(AUDIO_SAMPLE_RATE, dtype=np.float32)
+        audio, _ = librosa.load(
+            str(path), sr=AUDIO_SAMPLE_RATE, mono=True, dtype=np.float32
+        )
+    except Exception:
+        return np.zeros(AUDIO_SAMPLE_RATE, dtype=np.float32)
     if audio.size == 0 or not np.isfinite(audio).all():
-        raise ValueError(f"Invalid audio: {audio_path}")
+        return np.zeros(AUDIO_SAMPLE_RATE, dtype=np.float32)
     return audio
 
 
@@ -546,6 +566,41 @@ def fuse_voice_fake(panns_vf, df_vf):
     return panns_vf + (df_vf - panns_vf) * panns_vf
 
 
+def fuse_voice_fake_asymmetric(panns_vf, df_vf, fake_boost=0.35):
+    """게이트보다 fake에 관대: max 점수를 일부 보존 (ADS 회복용)."""
+    base = fuse_voice_fake(panns_vf, df_vf)
+    hi = max(float(panns_vf), float(df_vf))
+    return float(base + fake_boost * (hi - base))
+
+
+def load_vf_fusion(ckpt_path, device):
+    """train_fusion.py 산출물. 없으면 None."""
+    if ckpt_path is None or not Path(ckpt_path).is_file():
+        return None
+    from heads.vf_fusion import VoiceFakeFusion
+
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model = VoiceFakeFusion(
+        in_dim=int(payload.get("in_dim", 5)),
+        hidden=int(payload.get("hidden", 32)),
+    )
+    model.load_state_dict(payload["state_dict"])
+    model = model.to(device).eval()
+    print(f"Loaded VF fusion {ckpt_path}")
+    return model
+
+
+def combine_voice_fake(
+    panns_vf, df_vf, vp=0.0, fusion_model=None, gate_mode="bidir"
+):
+    """학습 fusion > asymmetric gate > bidirectional gate."""
+    if fusion_model is not None:
+        return fusion_model.predict_proba(panns_vf, df_vf, vp)
+    if gate_mode == "asym":
+        return fuse_voice_fake_asymmetric(panns_vf, df_vf)
+    return fuse_voice_fake(panns_vf, df_vf)
+
+
 def write_prediction_row(row, head_outputs):
     for column, value in head_outputs.items():
         row[column] = round(value, 10)
@@ -557,19 +612,29 @@ class FourHeadPredictor:
 
     Head VP: PANNs 음성 라벨 그룹 → VOICE_PRESENT_PROB
     Head MP: PANNs 음악 라벨 그룹 → MUSIC_PRESENT_PROB
-    Head VF: DF-Arena + (동의할 때만) PANNs VF
+    Head VF: DF-Arena + PANNs VF → learned fusion(있으면) / bidirectional gate
     Head MF: PANNs MF 헤드
 
     FILE_FAKE_PROB = 1 - (1 - VP×VF)(1 - MP×MF)
-    VF = bidirectional gate(PANNs VF, DF-Arena)
     """
 
-    def __init__(self, device, mf_ckpt, vf_ckpt, vf_device=None, df_lora=None):
+    def __init__(
+        self,
+        device,
+        mf_ckpt,
+        vf_ckpt,
+        vf_device=None,
+        df_lora=None,
+        vf_fusion=None,
+        gate_mode="bidir",
+    ):
         self.device = device
         self.mf_ckpt = mf_ckpt
         self.vf_ckpt = vf_ckpt
         self.vf_device = device if vf_device is None else vf_device
         self.df_lora = df_lora
+        self.vf_fusion = load_vf_fusion(vf_fusion, device)
+        self.gate_mode = gate_mode
 
     def run_presence_heads(self, audio_files):
         model, voice_indices, music_indices = load_panns_model(self.device)
@@ -678,9 +743,12 @@ class FourHeadPredictor:
             if skip_vf:
                 head_outputs["VOICE_FAKE_PROB"] = panns_score
             else:
-                head_outputs["VOICE_FAKE_PROB"] = fuse_voice_fake(
+                head_outputs["VOICE_FAKE_PROB"] = combine_voice_fake(
                     panns_score,
                     df_score,
+                    vp=head_outputs.get("VOICE_PRESENT_PROB", 0.0),
+                    fusion_model=self.vf_fusion,
+                    gate_mode=self.gate_mode,
                 )
             head_outputs["MUSIC_FAKE_PROB"] = music_fakes.get(audio_path.stem, 0.0)
             head_outputs_by_id[audio_path.stem] = head_outputs
@@ -719,7 +787,13 @@ def main():
     vf_name = args.device if args.vf_device == "auto" else args.vf_device
     vf_device = torch.device("cpu") if vf_name == "cpu" else select_device(vf_name)
     predictor = FourHeadPredictor(
-        device, args.mf_ckpt, args.vf_ckpt, vf_device, df_lora=args.df_lora
+        device,
+        args.mf_ckpt,
+        args.vf_ckpt,
+        vf_device,
+        df_lora=args.df_lora,
+        vf_fusion=args.vf_fusion,
+        gate_mode=args.vf_gate,
     )
     submission_rows = predictor.predict(audio_files, submission_rows)
 
