@@ -1,12 +1,21 @@
-DF-Arena 1B
-- Source: Speech-Arena-2025/DF_Arena_1B_V_1
-- Revision: fb6ce85de12c2c5a509d89114adaf827dd75f49f
-- Local directory: df_arena_1b
+AntiDeepfake XLS-R-1B (v3 VF backbone)
+- Source: nii-yamagishilab/xls-r-1b-anti-deepfake
+- Paper: Post-training for Deepfake Speech Detection (arXiv:2506.21090)
+- License: CC BY-NC-SA 4.0
+- Local directory: antideepfake_xlsr_1b
 
 HTDemucs
 - Model: htdemucs (955717e8-8726e21a)
 - Local directory: htdemucs
+- Role: vocal mask only (mix is encoded by AntiDeepfake)
 
 PANNs Cnn14
 - Checkpoint: Cnn14_mAP=0.431.pth
 - Local directory: panns
+- Role: VOICE/MUSIC PRESENT + MUSIC_FAKE head embeddings
+
+mf_head.pt
+- PANNs embedding → MUSIC_FAKE
+
+Deprecated in v3 submit (kept on disk optional):
+- df_arena_1b / df_arena_lora.pt / vf_head.pt / vf_fusion.pt

@@ -60,6 +60,7 @@ SKIP_DIR_NAMES = {
 }
 
 # 더 구체적인 이름을 먼저 검사한다. (vp, mp, vf, mf)
+# 구 스키마(Fake_Voice_Only…) + 신 스키마(voice_only_fake, voice_music_true_fake…)
 FOLDER_RULES = (
     ("Fake_Voice_Only", (1, 0, 1, 0)),
     ("Fake_Music_Only", (0, 1, 0, 1)),
@@ -69,8 +70,31 @@ FOLDER_RULES = (
     ("Music_Only", (0, 1, 0, 0)),
 )
 
+# voice_music_{voice}_{music}: true=real(0), fake=fake(1)
+EXACT_FOLDER_LABELS = {
+    "voice_only_fake": (1, 0, 1, 0),
+    "voice_only_true": (1, 0, 0, 0),
+    "music_only_fake": (0, 1, 0, 1),
+    "music_only_true": (0, 1, 0, 0),
+    "voice_music_fake_fake": (1, 1, 1, 1),
+    "voice_music_fake_true": (1, 1, 1, 0),
+    "voice_music_true_fake": (1, 1, 0, 1),
+    "voice_music_true_true": (1, 1, 0, 0),
+}
+
 
 def labels_from_folder(folder_name: str):
+    if folder_name in EXACT_FOLDER_LABELS:
+        vp, mp, vf, mf = EXACT_FOLDER_LABELS[folder_name]
+        file_fake = 1 if vf or mf else 0
+        return {
+            "VOICE_PRESENT": vp,
+            "MUSIC_PRESENT": mp,
+            "VOICE_FAKE": vf,
+            "MUSIC_FAKE": mf,
+            "FILE_FAKE": file_fake,
+            "rule": folder_name,
+        }
     for prefix, (vp, mp, vf, mf) in FOLDER_RULES:
         if folder_name.startswith(prefix):
             file_fake = 1 if vf or mf else 0

@@ -36,10 +36,27 @@ CODEC_SAMPLE_RATE = 14_000
 CODEC_BITS = 10
 AUG_PREFIXES = ("phone::", "codec::", "band::", "gain::", "noise::")
 
-REAL_RULES = {"Music_Only", "Voice_and_Music", "Voice_Only", "Fake_Voice_Only"}
-FAKE_RULES = {"Fake_Music_Only"}
-# 진짜 반주 + 가짜 보컬 믹스 (Drive: Music_FakeVocal_Mix)
-MIX_FAKE_VOICE_RULES = {"Music_FakeVocal"}
+REAL_RULES = {
+    "Music_Only",
+    "Voice_and_Music",
+    "Voice_Only",
+    "Fake_Voice_Only",
+    "voice_only_true",
+    "music_only_true",
+    "voice_music_true_true",
+}
+FAKE_RULES = {
+    "Fake_Music_Only",
+    "music_only_fake",
+    "voice_music_true_fake",  # real voice + fake music
+    "voice_music_fake_fake",
+}
+# 진짜 반주 + 가짜 보컬 믹스 (Drive: Music_FakeVocal_Mix / voice_music_fake_true)
+MIX_FAKE_VOICE_RULES = {
+    "Music_FakeVocal",
+    "voice_only_fake",
+    "voice_music_fake_true",
+}
 TRAIN_RULES = REAL_RULES | FAKE_RULES | MIX_FAKE_VOICE_RULES
 
 
@@ -273,6 +290,7 @@ def make_overlay_rows(
 
 def add_all_overlays(rows, count, seed):
     extras = []
+    # 구 스키마
     extras.extend(
         make_overlay_rows(rows, count, seed, "Voice_Only", "Fake_Music_Only", 0, 1, "overlay_rv_fm")
     )
@@ -379,6 +397,34 @@ def add_all_overlays(rows, count, seed):
             "overlay_ko_mg",
             voice_folder="Voice_Only_Zeroth",
             music_folder="Fake_Music_Only_MusicGen",
+        )
+    )
+    # 신 스키마 (deepfake_dataset): voice_only_fake × music_only_fake
+    new_n = max(count // 2, 0)
+    extras.extend(
+        make_overlay_rows(
+            rows, new_n, seed + 20, "voice_only_true", "music_only_fake", 0, 1, "overlay_nv_fm"
+        )
+    )
+    extras.extend(
+        make_overlay_rows(
+            rows, new_n, seed + 21, "voice_only_fake", "music_only_true", 1, 0, "overlay_fv_nm"
+        )
+    )
+    extras.extend(
+        make_overlay_rows(
+            rows, new_n, seed + 22, "voice_only_fake", "music_only_fake", 1, 1, "overlay_fv_fm_new"
+        )
+    )
+    # true 폴더가 비어 있으면 Fake_Voice / Music_Only 로 대체 교차
+    extras.extend(
+        make_overlay_rows(
+            rows, new_n, seed + 23, "Voice_Only", "music_only_fake", 0, 1, "overlay_rv_mf_new"
+        )
+    )
+    extras.extend(
+        make_overlay_rows(
+            rows, new_n, seed + 24, "voice_only_fake", "Music_Only", 1, 0, "overlay_vf_rm_new"
         )
     )
     return extras
@@ -529,11 +575,31 @@ def is_domain_focus_row(row):
     path = str(row.get("path", ""))
     if any(path.startswith(p) for p in AUG_PREFIXES):
         return False
-    if any(token in source for token in ("phone", "call", "zeroth", "tts", "mix")):
+    if any(
+        token in source
+        for token in (
+            "phone",
+            "call",
+            "zeroth",
+            "tts",
+            "mix",
+            "voice_only_fake",
+            "music_only_fake",
+            "voice_music",
+        )
+    ):
         return True
     if rule == "Voice_and_Music" or rule.startswith("overlay"):
         return True
-    if rule in {"Fake_Voice_Only", "Music_FakeVocal"}:
+    if rule in {
+        "Fake_Voice_Only",
+        "Music_FakeVocal",
+        "voice_only_fake",
+        "voice_music_fake_true",
+        "voice_music_true_fake",
+        "voice_music_fake_fake",
+        "music_only_fake",
+    }:
         return True
     return False
 

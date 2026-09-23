@@ -10,3 +10,5 @@ einops
 demucs
 panns-inference
 matplotlib==3.9.2
+huggingface_hub>=0.23.0
+safetensors>=0.4.0
